@@ -1,0 +1,21 @@
+[project]
+name = "brain-inspired-computing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "kagglehub>=0.3.13",
+    "mne>=1.11.0",
+    "numpy>=2.2.6",
+    "onnx>=1.19.1",
+    "onnxruntime>=1.23.2",
+    "onnxruntime-tools>=1.7.0",
+    "scikit-learn>=1.7.2",
+    "jupyter>=1.1.1",
+    "wfdb>=4.3.0",
+    "onnxscript>=0.5.6",
+    "torch>=2.9.1",
+    "torchao>=0.14.1",
+    "torchvision>=0.24.1",
+]
