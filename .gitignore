@@ -1,9 +1,10 @@
 .venv
 chb-mit-scalp-eeg-database-1.0.0
-processed_chb_mit/
+processed_chb_mit*
 uv.lock
 seizure-epilepcy-chb-mit-eeg-dataset-pediatric.zip
 __pycache__/
 *.pyc
 .DS_Store
 .ipynb_checkpoints
+*.log
