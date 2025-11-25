@@ -32,6 +32,11 @@ warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
 warnings.filterwarnings("ignore", message="Please use quant_min and quant_max to specify the range for observers")
 warnings.filterwarnings("ignore", message="must run observer before calling calculate_qparams")
 
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", None)
+pd.set_option("display.expand_frame_repr", False)
+
 
 # %% [markdown]
 # ---
@@ -544,7 +549,7 @@ def train_and_evaluate_o(
         scheduler.step(val_loss)
 
         print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
-              f"| val_loss={val_loss:.4f} | lr={current_lr:.2e}")
+                f"| val_loss={val_loss:.4f} | lr={current_lr:.2e}")
 
         # early stopping
         if val_loss < best_val_loss - 1e-4:
@@ -869,18 +874,15 @@ def _save_state_dict_get_size_mb(state_dict, path):
     size_mb = os.path.getsize(path) / (1024.0 * 1024.0)
     return size_mb
 
-def evaluate_model_torch(model, X: np.ndarray, y: np.ndarray, batch_size: int = 64, device: str = "cpu"):
+def _predict_model_probs(model, X: np.ndarray, batch_size: int = 64, device: str = "cpu"):
     """
-    Evaluate model on (X, y) and return ROC AUC (or None if undefined).
-    Model will be moved to CPU for evaluation.
+    Run model inference over X and return sigmoid probabilities as a 1D numpy array.
     """
-    # Some quantized models don't deepcopy cleanly; try deepcopy then fallback
     try:
         model_dev = copy.deepcopy(model)
     except Exception:
         model_dev = model
 
-    # Try move model to desired device; fall back to CPU if not supported
     try:
         model_dev = model_dev.to(device)
     except Exception:
@@ -892,47 +894,47 @@ def evaluate_model_torch(model, X: np.ndarray, y: np.ndarray, batch_size: int = 
 
     model_dev.eval()
 
-    X_t = torch.from_numpy(X).float().unsqueeze(1).to(device)  # (N,1,C,T)
-    y_arr = y
-
+    X_t = torch.from_numpy(X).float().unsqueeze(1)
     all_probs = []
     with torch.no_grad():
         for i in range(0, X_t.size(0), batch_size):
-            xb = X_t[i:i+batch_size]
+            xb = X_t[i:i+batch_size].to(device)
             try:
                 logits = model_dev(xb)
             except Exception:
-                # If model expects different input type/shape, try squeezing
                 logits = model_dev(xb)
-            # If logits are quantized tensors, dequantize first
-            try:
-                if hasattr(logits, 'dequantize'):
+
+            if hasattr(logits, "dequantize"):
+                try:
                     logits = logits.dequantize()
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
             try:
                 logits = logits.float()
             except Exception:
                 pass
 
-            probs = torch.sigmoid(logits)
-            # Move to CPU numpy and ensure 1D
-            probs = probs.cpu().numpy()
-            # ensure 1D
-            probs = np.asarray(probs).ravel()
-            # basic sanity checks
+            probs = torch.sigmoid(logits).detach().cpu().numpy().ravel()
             if np.isnan(probs).any() or np.isinf(probs).any():
-                logging.warning(f"evaluate_model_torch: encountered NaN/Inf in probs batch {i}")
+                logging.warning(f"_predict_model_probs: NaN/Inf detected in batch {i}")
                 return None
             all_probs.append(probs)
 
-    if len(all_probs) == 0:
+    if not all_probs:
         return None
+    return np.concatenate(all_probs, axis=0)
 
-    all_probs = np.concatenate(all_probs, axis=0)
+def evaluate_model_torch(model, X: np.ndarray, y: np.ndarray, batch_size: int = 64, device: str = "cpu"):
+    """
+    Evaluate model on (X, y) and return ROC AUC (or None if undefined).
+    Model will be moved to CPU for evaluation.
+    """
+    all_probs = _predict_model_probs(model, X, batch_size=batch_size, device=device)
+    if all_probs is None:
+        return None
     try:
-        auc = roc_auc_score(y_arr, all_probs)
+        auc = roc_auc_score(y, all_probs)
         return auc
     except ValueError:
         return None
@@ -982,6 +984,145 @@ def measure_avg_inference_time(model, X: np.ndarray, n_repeats: int = 3, device:
         total_per_sample += (t1 - t0) / float(n_samples)
 
     return total_per_sample / float(n_repeats)
+
+def _safe_round(value, digits=4):
+    if value is None:
+        return np.nan
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    if np.isnan(value) or np.isinf(value):
+        return np.nan
+    return round(value, digits)
+
+def _safe_int(value):
+    if value is None:
+        return 0
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+def _base_metrics_for_prefix(prefix: str) -> List[str]:
+    cols = [f"{prefix} ROC AUC"]
+    for label in (0, 1):
+        cols.extend([
+            f"{prefix} Precision {label}",
+            f"{prefix} Recall {label}",
+            f"{prefix} F1 {label}",
+            f"{prefix} Support {label}",
+        ])
+    cols.extend([
+        f"{prefix} Accuracy",
+        f"{prefix} Macro Precision",
+        f"{prefix} Macro Recall",
+        f"{prefix} Macro F1",
+        f"{prefix} Weighted Precision",
+        f"{prefix} Weighted Recall",
+        f"{prefix} Weighted F1",
+    ])
+    return cols
+
+def _build_prefix_columns(prefix: str) -> List[str]:
+    cols = []
+    for base in _base_metrics_for_prefix(prefix):
+        cols.append(base)
+        cols.append(f"{base} Δ")
+        cols.append(f"{base} Δ%")
+    return cols
+
+BASE_PREFIX_COLUMN_MAP = {
+    "Val": _base_metrics_for_prefix("Val"),
+    "Test": _base_metrics_for_prefix("Test"),
+}
+PREFIX_COLUMN_MAP = {
+    "Val": _build_prefix_columns("Val"),
+    "Test": _build_prefix_columns("Test"),
+}
+BASE_CLASS_COLUMNS = BASE_PREFIX_COLUMN_MAP["Val"] + BASE_PREFIX_COLUMN_MAP["Test"]
+CLASS_COLUMNS = PREFIX_COLUMN_MAP["Val"] + PREFIX_COLUMN_MAP["Test"]
+
+def _is_valid_number(value):
+    if value is None:
+        return False
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            return not np.isnan(float(value))
+        except Exception:
+            return False
+    return False
+
+def _delta_value(current, baseline, digits=6):
+    if _is_valid_number(current) and _is_valid_number(baseline):
+        return round(float(current) - float(baseline), digits)
+    return None
+
+def _delta_pct(current, baseline):
+    if _is_valid_number(current) and _is_valid_number(baseline) and float(baseline) != 0.0:
+        return pct(safe_pct(float(current), float(baseline)))
+    return ""
+
+def _metrics_from_probs(y_true: np.ndarray, probs: Optional[np.ndarray], prefix: str):
+    metrics = {}
+    base_cols = BASE_PREFIX_COLUMN_MAP[prefix]
+    if probs is None or len(probs) == 0:
+        for col in base_cols:
+            metrics[col] = 0 if "Support" in col else np.nan
+        return metrics
+
+    probs = probs.ravel()
+    y_true_int = y_true.astype(int)
+    preds = (probs >= 0.5).astype(int)
+    preds_int = preds.astype(int)
+
+    report = classification_report(
+        y_true_int,
+        preds_int,
+        digits=4,
+        output_dict=True,
+        zero_division=0
+    )
+
+    try:
+        metrics[f"{prefix} ROC AUC"] = _safe_round(roc_auc_score(y_true_int, probs), 6)
+    except ValueError:
+        metrics[f"{prefix} ROC AUC"] = np.nan
+
+    for label in (0, 1):
+        key = str(label)
+        cls_report = report.get(key)
+        if cls_report is None:
+            # classification_report may label floats as "0.0"
+            cls_report = report.get(f"{float(label):.1f}", {})
+        metrics[f"{prefix} Precision {label}"] = _safe_round(cls_report.get("precision"))
+        metrics[f"{prefix} Recall {label}"] = _safe_round(cls_report.get("recall"))
+        metrics[f"{prefix} F1 {label}"] = _safe_round(cls_report.get("f1-score"))
+        metrics[f"{prefix} Support {label}"] = _safe_int(cls_report.get("support"))
+
+    metrics[f"{prefix} Accuracy"] = _safe_round(report.get("accuracy"))
+
+    macro = report.get("macro avg", {})
+    metrics[f"{prefix} Macro Precision"] = _safe_round(macro.get("precision"))
+    metrics[f"{prefix} Macro Recall"] = _safe_round(macro.get("recall"))
+    metrics[f"{prefix} Macro F1"] = _safe_round(macro.get("f1-score"))
+
+    weighted = report.get("weighted avg", {})
+    metrics[f"{prefix} Weighted Precision"] = _safe_round(weighted.get("precision"))
+    metrics[f"{prefix} Weighted Recall"] = _safe_round(weighted.get("recall"))
+    metrics[f"{prefix} Weighted F1"] = _safe_round(weighted.get("f1-score"))
+
+    return metrics
+
+def _collect_dataset_metrics(model, X_split, y_split, prefix: str, batch_size: int = 64, device: str = "cpu"):
+    probs = _predict_model_probs(model, X_split, batch_size=batch_size, device=device)
+    return _metrics_from_probs(y_split, probs, prefix)
+
+def collect_all_metrics_torch(model, batch_size: int = 64, device: str = "cpu"):
+    metrics = {}
+    metrics.update(_collect_dataset_metrics(model, X_val, y_val, "Val", batch_size=batch_size, device=device))
+    metrics.update(_collect_dataset_metrics(model, X_test, y_test, "Test", batch_size=batch_size, device=device))
+    return metrics
 
 # %% 1. Build train & test datasets
 # 1. Build train & test datasets
@@ -1177,17 +1318,18 @@ int8_dyn_time = measure_avg_inference_time(model_int8_dynamic, X_test, n_repeats
 print("Running inference speed comparison (CPU)...")
 int8_dyn_auc = evaluate_model_torch(model_int8_dynamic, X_test, y_test, device='cpu')
 
-results_df = pd.DataFrame(columns=[
+RESULT_COLUMNS = [
     "Model",
     "Size (MB)",
     "Compression (x)",
     "Compression (%)",
     "Inference time (ms)",
     "Speedup Δ%",
-    "ROC AUC",
     "AUC drop",
     "AUC Δ%"
-])
+] + CLASS_COLUMNS
+
+results_df = pd.DataFrame(columns=RESULT_COLUMNS)
 
 def pct(delta):
     if delta is None:
@@ -1200,52 +1342,90 @@ def safe_pct(num, denom):
     except:
         return None
 
-def add(name, size, auc, time):
+def add(name, model=None, size=None, inference_time=None, metrics=None, eval_device="cpu"):
     global results_df
 
-    # If first entry → baseline (self comparison)
-    if len(results_df) == 0:
-        results_df.loc[0] = {
-            "Model": name,
-            "Size (MB)": round(size, 4),
-            "Compression (x)": 1.0,
-            "Compression (%)": 0.0,
-            "Inference time (ms)": round(time * 1000, 4),
-            "Speedup Δ%": "+0.00%",
-            "ROC AUC": round(auc, 6),
-            "AUC drop": 0.0,
-            "AUC Δ%": "+0.00%"
-        }
-        return
+    if metrics is None:
+        if model is not None:
+            metrics = collect_all_metrics_torch(model, device=eval_device)
+        else:
+            metrics = {}
+            for col in BASE_CLASS_COLUMNS:
+                metrics[col] = 0 if "Support" in col else np.nan
 
-    # Baseline = first row
-    base = results_df.iloc[0]
+    test_auc = metrics.get("Test ROC AUC")
+    # val metrics included within `metrics`
+    size_mb = round(size, 4) if size is not None else None
+    inference_ms = round(inference_time * 1000, 4) if inference_time is not None else None
+
+    is_baseline = len(results_df) == 0
+    base = results_df.iloc[0] if not is_baseline else None
 
     # Absolute values
-    compression_x = base["Size (MB)"] / size
-    compression_pct = (1 - size / base["Size (MB)"]) * 100
-    auc_drop = base["ROC AUC"] - auc
+    if is_baseline:
+        compression_x = 1.0
+        compression_pct = 0.0
+        auc_drop = 0.0 if test_auc is not None else None
+        acc_pct = 0.0 if test_auc is not None else None
+        speed_pct = 0.0
+    else:
+        base_size = base["Size (MB)"]
+        base_time = base["Inference time (ms)"]
+        base_auc = base.get("Test ROC AUC")
 
-    # Percentage deltas
-    size_pct = safe_pct(size, base["Size (MB)"])
-    speed_pct = safe_pct(base["Inference time (ms)"], (time * 1000))
-    acc_pct = safe_pct(auc, base["ROC AUC"])
+        compression_x = None
+        compression_pct = None
+        if base_size not in (None, 0) and size_mb not in (None, 0):
+            compression_x = base_size / size_mb
+            compression_pct = (1 - size_mb / base_size) * 100
 
-    results_df.loc[len(results_df)] = {
+        auc_drop = None
+        acc_pct = None
+        if base_auc is not None and test_auc is not None:
+            auc_drop = base_auc - test_auc
+            acc_pct = safe_pct(test_auc, base_auc)
+
+        speed_pct = None
+        if base_time not in (None, 0) and inference_ms not in (None, 0):
+            speed_pct = safe_pct(base_time, inference_ms)
+
+    row = {
         "Model": name,
-        "Size (MB)": round(size, 4),
-        "Compression (x)": round(compression_x, 4),
-        "Compression (%)": round(compression_pct, 2),
-        "Inference time (ms)": round(time * 1000, 4),
+        "Size (MB)": size_mb,
+        "Compression (x)": round(compression_x, 4) if compression_x is not None else None,
+        "Compression (%)": round(compression_pct, 2) if compression_pct is not None else None,
+        "Inference time (ms)": inference_ms,
         "Speedup Δ%": pct(speed_pct),
-        "ROC AUC": round(auc, 6),
-        "AUC drop": round(auc_drop, 6),
+        "AUC drop": round(auc_drop, 6) if auc_drop is not None else None,
         "AUC Δ%": pct(acc_pct)
     }
+
+    for col in BASE_CLASS_COLUMNS:
+        value = metrics.get(col)
+        row[col] = value
+        delta_col = f"{col} Δ"
+        delta_pct_col = f"{col} Δ%"
+        if is_baseline:
+            if _is_valid_number(value):
+                row[delta_col] = 0 if isinstance(value, (int, np.integer)) else 0.0
+                row[delta_pct_col] = "+0.00%"
+            else:
+                row[delta_col] = None
+                row[delta_pct_col] = ""
+        else:
+            base_value = base.get(col)
+            row[delta_col] = _delta_value(value, base_value)
+            row[delta_pct_col] = _delta_pct(value, base_value)
+
+    if is_baseline:
+        results_df.loc[0] = row
+    else:
+        results_df.loc[len(results_df)] = row
 # --- Record results ---
-add("FP32", fp32_size, fp32_auc, fp32_time)
-add("Dynamic INT8", int8_dyn_size, int8_dyn_auc, int8_dyn_time)
+add("FP32", model=model_fp32, size=fp32_size, inference_time=fp32_time)
+add("Dynamic INT8", model=model_int8_dynamic, size=int8_dyn_size, inference_time=int8_dyn_time)
 print("Dynamic Quantization Comparison Finished!")
+print(results_df.to_string(index=False))
 results_df
 
 # %% [markdown]
@@ -1373,8 +1553,9 @@ print("Evaluating Static Eager INT8 model (CPU)...")
 static_eager_auc = evaluate_model_torch(model_int8_static_eager, X_test, y_test, device="cpu")
 print("Running inference speed comparison (CPU)...")
 static_eager_time = measure_avg_inference_time(model_int8_static_eager, X_test, n_repeats=2, device="cpu")
-add("Static Eager INT8", int8_static_eager_size, static_eager_auc, static_eager_time)
+add("Static Eager INT8", model=model_int8_static_eager, size=int8_static_eager_size, inference_time=static_eager_time)
 print("Static Eager INT8 Quantization Comparison Finished!")
+print(results_df.to_string(index=False))
 results_df
 
 # %% [markdown]
@@ -1422,8 +1603,9 @@ static_auc = evaluate_model_torch(model_int8_static, X_test, y_test, device="cpu
 print("Running inference speed comparison (CPU)...")
 static_time = measure_avg_inference_time(model_int8_static, X_test, n_repeats=2, device="cpu")
 
-add("Static FX INT8", int8_static_size, static_auc, static_time)
+add("Static FX INT8", model=model_int8_static, size=int8_static_size, inference_time=static_time)
 print("Static FX Quantization Comparison Finished!")
+print(results_df.to_string(index=False))
 results_df
 
 # %% [markdown]
@@ -1578,11 +1760,12 @@ else:
     qat_time = measure_avg_inference_time(model_int8_qat, X_test, n_repeats=2, device="cpu")
 
     # Add to results table
-    add("QAT FX INT8", qat_int8_size, qat_auc, qat_time)
+    add("QAT FX INT8", model=model_int8_qat, size=qat_int8_size, inference_time=qat_time)
 
     # Show updated results DataFrame
     print("QAT FX Quantization Comparison Finished!")
 
+print(results_df.to_string(index=False))
 results_df
 
 # %% [markdown]
@@ -1663,9 +1846,26 @@ def eval_onnx(path):
     auc = roc_auc_score(y_test, probs)
     return auc, probs
 
+def collect_all_metrics_onnx(model_path: str, batch: int = 32):
+    if not os.path.exists(model_path):
+        return None
+    try:
+        sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    except Exception as e:
+        logging.warning(f"collect_all_metrics_onnx: failed to load {model_path}: {e}")
+        return None
+
+    metrics = {}
+    val_probs = onnx_predict(sess, X_val, batch=batch)
+    metrics.update(_metrics_from_probs(y_val, val_probs, "Val"))
+
+    test_probs = onnx_predict(sess, X_test, batch=batch)
+    metrics.update(_metrics_from_probs(y_test, test_probs, "Test"))
+    return metrics
+
 fp32_onnx_auc = None
 if fp32_onnx_available:
-    print("\n Evaluating FP32 ONNX baseline")
+    print("Evaluating FP32 ONNX baseline")
     fp32_onnx_auc, _ = eval_onnx(onnx_fp32_path)
     print("FP32 ONNX AUC:", fp32_onnx_auc)
 else:
@@ -1678,9 +1878,9 @@ else:
 dyn_onnx_available = os.path.exists(onnx_int8_dynamic_path)
 
 if dyn_onnx_available:
-    print(f"\n Using cached Dynamic INT8 ONNX model at {onnx_int8_dynamic_path}")
+    print(f"Using cached Dynamic INT8 ONNX model at {onnx_int8_dynamic_path}")
 elif fp32_onnx_available:
-    print("\n ONNX Dynamic INT8 quantization")
+    print("ONNX Dynamic INT8 quantization")
     quantize_dynamic(
         model_input=onnx_fp32_path,
         model_output=onnx_int8_dynamic_path,
@@ -1723,9 +1923,9 @@ class EEGCalibReader(CalibrationDataReader):
         return {"input": b[:, None, :, :].astype(np.float32)}
 
 if static_onnx_available:
-    print(f"\n Using cached Static INT8 ONNX model at {onnx_int8_static_path}")
+    print(f"Using cached Static INT8 ONNX model at {onnx_int8_static_path}")
 elif fp32_onnx_available:
-    print("\n Running static QDQ INT8 quantization")
+    print("Running static QDQ INT8 quantization")
     quantize_static(
         model_input=onnx_fp32_path,
         model_output=onnx_int8_static_path,
@@ -1782,14 +1982,19 @@ fp32_size_mb = onnx_size(onnx_fp32_path) if fp32_onnx_available else None
 dyn_size_mb = onnx_size(onnx_int8_dynamic_path) if dyn_onnx_available else None
 static_size_mb = onnx_size(onnx_int8_static_path) if static_onnx_available else None
 
+fp32_onnx_metrics = collect_all_metrics_onnx(onnx_fp32_path) if fp32_onnx_available else None
+dyn_onnx_metrics = collect_all_metrics_onnx(onnx_int8_dynamic_path) if dyn_onnx_available else None
+static_onnx_metrics = collect_all_metrics_onnx(onnx_int8_static_path) if static_onnx_available else None
+
 # --- Add FP32 ONNX baseline ---
-add("FP32 ONNX", fp32_size_mb, fp32_onnx_auc, fp32_time_onnx)
+add("FP32 ONNX", size=fp32_size_mb, inference_time=fp32_time_onnx, metrics=fp32_onnx_metrics)
 # --- Add Dynamic INT8 ONNX ---
-add("Dynamic INT8 ONNX", dyn_size_mb, dyn_auc, dyn_time_onnx)
+add("Dynamic INT8 ONNX", size=dyn_size_mb, inference_time=dyn_time_onnx, metrics=dyn_onnx_metrics)
 # --- Add Static INT8 ONNX ---
-add("Static INT8 ONNX", static_size_mb, static_auc, static_time_onnx)
+add("Static INT8 ONNX", size=static_size_mb, inference_time=static_time_onnx, metrics=static_onnx_metrics)
 # Show updated DataFrame
 print("QAT FX Quantization Comparison Finished!")
+print(results_df.to_string(index=False))
 results_df
 
 # %% [markdown]
@@ -1953,9 +2158,10 @@ fused_int8_path = os.path.join(PROCESSED_DIR, "model_int8_fused_fx_state.pth")
 torch.save(model_int8_fx.state_dict(), fused_int8_path)
 fused_static_mb = _model_size_mb(fused_int8_path)
 
-add("Fused FX INT8", fused_static_mb, int8_fx_auc, int8_fx_time)
-
-print("\n Final comparison complete!")
+add("Fused FX INT8", model=model_int8_fx, size=fused_static_mb, inference_time=int8_fx_time)
+print("Fused FX INT8 comparison complete!")
+print(results_df.to_string(index=False))
+results_df
 
 #%% [markdown]
 # ---
@@ -1998,6 +2204,7 @@ print("Training fused QAT on:", device)
 for epoch in range(QAT_FUSED_EPOCHS):
     model_qat_fused_prepared.train()
     running_loss = 0
+    train_samples = 0
 
     for xb, yb in qat_train_loader:
         xb, yb = xb.to(device), yb.to(device)
@@ -2009,8 +2216,25 @@ for epoch in range(QAT_FUSED_EPOCHS):
         optimizer.step()
 
         running_loss += loss.item() * xb.size(0)
+        train_samples += xb.size(0)
 
-    print(f"Epoch {epoch+1}/{QAT_FUSED_EPOCHS} - Loss {running_loss/len(qat_train_loader.dataset):.4f}")
+    train_loss = running_loss / max(1, train_samples)
+
+    # Validation loss tracking
+    model_qat_fused_prepared.eval()
+    val_running_loss = 0.0
+    val_samples = 0
+    with torch.no_grad():
+        for xb, yb in qat_val_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            logits = model_qat_fused_prepared(xb)
+            loss = criterion(logits, yb)
+            val_running_loss += loss.item() * xb.size(0)
+            val_samples += xb.size(0)
+
+    val_loss = val_running_loss / max(1, val_samples)
+
+    print(f"Epoch {epoch+1}/{QAT_FUSED_EPOCHS} - Train Loss {train_loss:.4f} - Val Loss {val_loss:.4f}")
 
 print("Fused QAT training complete.")
 
@@ -2027,8 +2251,9 @@ int8_qat_fused_size = os.path.getsize(int8_qat_fused_path) / (1024*1024)
 qat_fused_auc = evaluate_model_torch(model_int8_qat_fused, X_test, y_test)
 qat_fused_time = measure_avg_inference_time(model_int8_qat_fused, X_test)
 
-add("Fused QAT FX INT8", int8_qat_fused_size, qat_fused_auc, qat_fused_time)
+add("Fused QAT FX INT8", model=model_int8_qat_fused, size=int8_qat_fused_size, inference_time=qat_fused_time)
 print("Fused QAT comparison complete!")
+print(results_df.to_string(index=False))
 results_df
 
 # %% [markdown]
@@ -2042,5 +2267,9 @@ print("FINAL SUMMARY TABLE - ALL METHODS COMPARED\n")
 print("All Quantization Methods Comparison:")
 print(results_df.to_string(index=False))
 results_df
+
+#%%
+csv_path = os.path.join(PROCESSED_DIR, "quantization_results.csv")
+results_df.to_csv(csv_path, index=True)
 
 #%%
