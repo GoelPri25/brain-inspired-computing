@@ -22,10 +22,14 @@ from sklearn.model_selection import train_test_split
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from scipy.special import expit
+from sklearn.metrics import accuracy_score
+
 
 import torch.ao.quantization as tq
 from torch.ao.quantization import get_default_qconfig_mapping, get_default_qat_qconfig_mapping, get_default_qat_qconfig, fuse_modules
 from torch.ao.quantization.quantize_fx import prepare_fx, prepare_qat_fx, convert_fx
+
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
@@ -39,8 +43,9 @@ pd.set_option("display.expand_frame_repr", False)
 
 
 # %% [markdown]
-# ---
 # ### 1. CONFIGURATION
+# ---
+
 # %%
 # Path to the root folder containing CHB-MIT patient directories (chb01, chb02, ...)
 #DATA_ROOT = "./dataset/chb-mit-1.0.0"
@@ -87,8 +92,9 @@ EPOCHS = 200
 EARLY_STOPPING_PATIENCE = 20
 
 # %% [markdown]
+# ### 2. SETUP & UTILITIES 
 # ---
-# ### 2. SETUP & UTILITIES
+
 # %%
 def setup_logging():
     os.makedirs(PROCESSED_DIR, exist_ok=True)
@@ -145,7 +151,6 @@ def processed_files_exist(processed_dir):
     return all(os.path.exists(os.path.join(processed_dir, f)) for f in required)
 
 # %% [markdown]
-# ---
 # ### 3. Data Processing 
 # ---
 # #### 3.1 SEIZURE ANNOTATIONS
@@ -337,13 +342,16 @@ def build_dataset_from_files(files: List[str]) -> Tuple[np.ndarray, np.ndarray, 
     y = np.concatenate(all_labels, axis=0)
 
     logging.info(f"Built dataset: X.shape={X.shape}, y.shape={y.shape}, "
-                 f"seizure_ratio={y.mean():.4f}")
+                f"seizure_ratio={y.mean():.4f}")
 
     return X, y.astype(bool), TARGET_FS
 
 # %% [markdown]
-# ---
+# # Stage 2: Baseline creation
+
+# %% [markdown]
 # ### 4. MODEL DEFINITION 
+# ---
 class EEGCNN(nn.Module):
     """
     2D CNN for EEG windows.
@@ -352,289 +360,56 @@ class EEGCNN(nn.Module):
     Returns raw logits of shape: (batch_size, 1)
     """
 
-    def __init__(self):
+    def __init__(self, in_channels):
         super().__init__()
-
-        # ---- Conv blocks ----
-        self.conv1 = nn.Conv2d(
-            in_channels=1,
-            out_channels=64,
-            kernel_size=(2, 4),
-            padding=(1, 1),
-        )
-        self.conv2 = nn.Conv2d(
-            in_channels=64,
-            out_channels=64,
-            kernel_size=(2, 4),
-            stride=(1, 2),
-            padding=(1, 1),
-        )
-        self.maxpool1 = nn.MaxPool2d(kernel_size=(1, 2))
-
-        self.conv3 = nn.Conv2d(
-            in_channels=64,
-            out_channels=128,
-            kernel_size=(2, 4),
-            padding=(1, 1),
-        )
-        self.conv4 = nn.Conv2d(
-            in_channels=128,
-            out_channels=128,
-            kernel_size=(2, 4),
-            stride=(1, 2),
-            padding=(1, 1),
-        )
-        self.maxpool2 = nn.MaxPool2d(kernel_size=(2, 2))
-
-        self.conv5 = nn.Conv2d(
-            in_channels=128,
-            out_channels=256,
-            kernel_size=(4, 4),
-            padding=(1, 1),
-        )
-        self.conv6 = nn.Conv2d(
-            in_channels=256,
-            out_channels=256,
-            kernel_size=(4, 4),
-            stride=(1, 2),
-            padding=(1, 1),
-        )
-        self.maxpool3 = nn.MaxPool2d(kernel_size=(1, 2))
-
-        # ---- Global pooling ----
-        self.global_avgpool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # ---- Fully connected head ----
-        self.fc1 = nn.Linear(256, 256)
-        self.dropout1 = nn.Dropout(0.25)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.dropout2 = nn.Dropout(0.25)
-        self.fc4 = nn.Linear(64, 1)  # output logits (no sigmoid here!)
-
-        # Optional: weight init (can help a bit)
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        
+        # 1D Convolutional Blocks
+        self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool1d(2)
+        
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool1d(2)
+        
+        self.conv5 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.conv6 = nn.Conv1d(256, 256, kernel_size=3, padding=1)
+        self.pool3 = nn.MaxPool1d(2)
+        
+        # Classification Head
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc1 = nn.Linear(256, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1) # Final logic (binary)
 
     def forward(self, x):
-        # x: (B, 1, C, T)
+        # x: (B, C, T)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
-        x = self.maxpool1(x)
-
+        x = self.pool1(x)
+        
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
-        x = self.maxpool2(x)
-
+        x = self.pool2(x)
+        
         x = F.relu(self.conv5(x))
         x = F.relu(self.conv6(x))
-        x = self.maxpool3(x)
-
-        x = self.global_avgpool(x)       # (B, 256, 1, 1)
-        x = torch.flatten(x, 1)          # (B, 256)
-
+        x = self.pool3(x)
+        
+        # Global Average Pooling
+        x = self.global_pool(x).squeeze(-1) # (B, 256)
+        
         x = F.relu(self.fc1(x))
-        x = self.dropout1(x)
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = self.dropout2(x)
-
-        x = self.fc4(x)                  # logits, shape (B, 1)
+        x = self.fc3(x) # (B, 1)
+        
         return x.squeeze(1)
 
 # %% [markdown]
-# ---
 # ### 5. TRAINING & EVALUATION 
+# ---
+
 # %%
-def train_and_evaluate_o(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    X_test: np.ndarray,
-    y_test: np.ndarray
-):
-    """
-    Train the CNN (PyTorch) and evaluate on validation and test sets.
-    Also records and plots training curves (train/val loss + LR).
-    """
-
-    # ---- prepare tensors & loaders ----
-    X_train_t = torch.from_numpy(X_train).float().unsqueeze(1)  # (N,1,C,T)
-    X_val_t   = torch.from_numpy(X_val).float().unsqueeze(1)
-    X_test_t  = torch.from_numpy(X_test).float().unsqueeze(1)
-
-    y_train_t = torch.from_numpy(y_train.astype(np.float32))
-    y_val_t   = torch.from_numpy(y_val.astype(np.float32))
-    y_test_t  = torch.from_numpy(y_test.astype(np.float32))
-
-    train_ds = TensorDataset(X_train_t, y_train_t)
-    val_ds   = TensorDataset(X_val_t, y_val_t)
-    test_ds  = TensorDataset(X_test_t, y_test_t)
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
-
-    # ---- model, loss, optimizer, scheduler ----
-    model = EEGCNN().to(DEVICE)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=5,
-    )
-
-    best_val_loss = float("inf")
-    best_state = None
-    epochs_no_improve = 0
-
-    # history containers
-    train_losses = []
-    val_losses = []
-    lrs = []
-
-    # ---- training loop ----
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        running_loss = 0.0
-
-        for xb, yb in train_loader:
-            xb = xb.to(DEVICE)
-            yb = yb.to(DEVICE)
-
-            optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * xb.size(0)
-
-        train_loss = running_loss / len(train_loader.dataset)
-
-        # ---- validation ----
-        model.eval()
-        val_running_loss = 0.0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(DEVICE)
-                yb = yb.to(DEVICE)
-                logits = model(xb)
-                loss = criterion(logits, yb)
-                val_running_loss += loss.item() * xb.size(0)
-
-        val_loss = val_running_loss / len(val_loader.dataset)
-
-        # record history + lr
-        current_lr = optimizer.param_groups[0]["lr"]
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        lrs.append(current_lr)
-
-        # step LR scheduler
-        scheduler.step(val_loss)
-
-        print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
-                f"| val_loss={val_loss:.4f} | lr={current_lr:.2e}")
-
-        # early stopping
-        if val_loss < best_val_loss - 1e-4:
-            best_val_loss = val_loss
-            best_state = model.state_dict()
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
-                print(f"Early stopping at epoch {epoch}")
-                break
-
-    # restore best weights
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    # ---- evaluation helper ----
-    def eval_on_loader(loader):
-        model.eval()
-        all_probs, all_labels = [], []
-        with torch.no_grad():
-            for xb, yb in loader:
-                xb = xb.to(DEVICE)
-                logits = model(xb)
-                probs = torch.sigmoid(logits)
-                all_probs.append(probs.cpu().numpy())
-                all_labels.append(yb.cpu().numpy())
-        all_probs = np.concatenate(all_probs)
-        all_labels = np.concatenate(all_labels)
-        preds = (all_probs > 0.5).astype(int)
-        return all_labels, all_probs, preds
-
-    # ---- validation metrics ----
-    y_val_true, y_val_probs, y_val_pred = eval_on_loader(val_loader)
-    print("=== Validation report (threshold=0.5) ===")
-    print(classification_report(y_val_true, y_val_pred, digits=4))
-    try:
-        val_auc = roc_auc_score(y_val_true, y_val_probs)
-        print(f"Validation ROC AUC: {val_auc:.4f}")
-    except ValueError:
-        print("Validation ROC AUC: not defined (only one class present).")
-
-    # ---- test metrics ----
-    y_test_true, y_test_probs, y_test_pred = eval_on_loader(test_loader)
-    print("=== Test report (threshold=0.5) ===")
-    print(classification_report(y_test_true, y_test_pred, digits=4))
-    try:
-        test_auc = roc_auc_score(y_test_true, y_test_probs)
-        print(f"Test ROC AUC: {test_auc:.4f}")
-    except ValueError:
-        print("Test ROC AUC: not defined (only one class present).")
-
-    # ---- PLOTS: training curves ----
-    epochs_range = range(1, len(train_losses) + 1)
-
-    # Loss curves
-    plt.figure(figsize=(6, 4))
-    plt.plot(epochs_range, train_losses, label="Train loss")
-    plt.plot(epochs_range, val_losses, label="Val loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training / validation loss")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-    # LR curve
-    plt.figure(figsize=(6, 4))
-    plt.plot(epochs_range, lrs)
-    plt.xlabel("Epoch")
-    plt.ylabel("Learning rate")
-    plt.title("Learning rate schedule")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-    history = {
-        "train_loss": train_losses,
-        "val_loss": val_losses,
-        "lr": lrs,
-    }
-
-    return model, history
-
 def train_and_evaluate(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -651,9 +426,9 @@ def train_and_evaluate(
     """
 
     # ---- prepare tensors & loaders ----
-    X_train_t = torch.from_numpy(X_train).float().unsqueeze(1)  # (N,1,C,T)
-    X_val_t   = torch.from_numpy(X_val).float().unsqueeze(1)
-    X_test_t  = torch.from_numpy(X_test).float().unsqueeze(1)
+    X_train_t = torch.from_numpy(X_train).float()  # (N,C,T)
+    X_val_t   = torch.from_numpy(X_val).float()
+    X_test_t  = torch.from_numpy(X_test).float()
 
     y_train_t = torch.from_numpy(y_train.astype(np.float32))
     y_val_t   = torch.from_numpy(y_val.astype(np.float32))
@@ -668,7 +443,7 @@ def train_and_evaluate(
     test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # ---- model, loss, optimizer, scheduler ----
-    model = EEGCNN().to(DEVICE)
+    model = EEGCNN(in_channels=len(CHANNELS)).to(DEVICE)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -758,9 +533,9 @@ def train_and_evaluate(
 
         # Keras-style line
         print(f"{epoch}/{EPOCHS} - {epoch_time:.0f}s - {ms_per_step:.0f}ms/step "
-              f"- accuracy: {train_acc:.4f} - loss: {train_loss:.4f} "
-              f"- val_accuracy: {val_acc:.4f} - val_loss: {val_loss:.4f} "
-              f"- lr: {current_lr:.2e}")
+                f"- accuracy: {train_acc:.4f} - loss: {train_loss:.4f} "
+                f"- val_accuracy: {val_acc:.4f} - val_loss: {val_loss:.4f} "
+                f"- lr: {current_lr:.2e}")
 
         # ---- early stopping ----
         if val_loss < best_val_loss - 1e-4:
@@ -862,8 +637,8 @@ def train_and_evaluate(
 
 
 # %% [markdown]
-#  ---
 #  ### 6. MAIN PIPELINE
+#  ---
 # %% 0. config & setup
 # 0. config & setup
 setup_logging()
@@ -1200,7 +975,7 @@ history_path = os.path.join(PROCESSED_DIR, "seizure_cnn_history.pth")
 
 if os.path.exists(model_path):
     print(f"Model exists loading from {model_path}")
-    model = EEGCNN().to(DEVICE)
+    model = EEGCNN(in_channels=len(CHANNELS)).to(DEVICE)
     state = torch.load(model_path, map_location=DEVICE)
     model.load_state_dict(state)
     model.eval()
@@ -1216,11 +991,7 @@ if os.path.exists(model_path):
             history = None
 else:
     print("Training model from scratch...")
-    model, history = train_and_evaluate(
-        X_train, y_train,
-        X_val, y_val,
-        X_test, y_test
-    )
+    model, history = train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test)
 
     # Save FP32 model weights
     torch.save(model.state_dict(), model_path)
@@ -1269,8 +1040,282 @@ print(f"FP32 avg inference time: {fp32_time*1000:.2f} ms")
 print(f"FP32 ROC AUC: {fp32_auc}")
 
 # %% [markdown]
-# ---
-#### 7. MODEL QUANTIZATION & COMPARISONS
+# # Stage 3 — SNN conversion & inference
+
+# %%
+baseline = EEGCNN(in_channels=len(CHANNELS))
+baseline.load_state_dict(torch.load(model_path, map_location=DEVICE))
+baseline.to(DEVICE)
+baseline.eval()
+
+snn_model = copy.deepcopy(baseline)
+snn_model.eval()
+
+def max_activation(model, X_sample, DEVICE):
+    act = {}
+    def hook_output(name):
+        def hook(model, input, output):
+            output = output.detach().abs()
+            val = torch.quantile(output.detach().abs(), 0.999).item()
+            act[name] = max(1e-5,val)
+        return hook
+
+    hooks = []
+    
+    for name, m in model.named_modules():
+        if isinstance(m, (nn.Conv1d, nn.Linear)):
+            hooks.append(m.register_forward_hook(hook_output(name)))
+    try:
+        X_tensor = torch.tensor(X_sample).float().to(DEVICE)
+        input_max = torch.quantile(X_tensor.abs(), 0.999).item()
+        with torch.no_grad():
+            model(X_tensor)
+    finally:
+        for h in hooks: 
+            h.remove()
+    return act, input_max
+
+max_activations, input_max = max_activation(baseline, X_test[:200], DEVICE)
+
+layer_names = ['conv1', 'conv2', 'conv3', 'conv4', 'conv5', 'conv6', 'fc1', 'fc2', 'fc3']
+prev_max = input_max
+
+with torch.no_grad():
+    for name in layer_names:
+        layer = dict(snn_model.named_modules())[name]
+        curr_max = max_activations[name]
+ 
+        layer.weight.data *= prev_max / curr_max
+        if layer.bias is not None:
+            layer.bias.data *= 1.0 / curr_max
+        prev_max = curr_max
+
+class IFNeuron(nn.Module):
+    def __init__(self, th=1.0):
+        super().__init__()
+        self.th = th
+    
+    def forward(self, x, mem):
+        mem += x
+        spike = (mem >= self.th).float()
+        mem = mem - spike * self.th # Soft reset
+        return spike, mem
+
+class SNN_Norm(nn.Module):
+    def __init__(self, normalized_model):
+        super().__init__()
+        self.conv1 = normalized_model.conv1
+        self.conv2 = normalized_model.conv2
+        self.pool1 = normalized_model.pool1
+        self.conv3 = normalized_model.conv3
+        self.conv4 = normalized_model.conv4
+        self.pool2 = normalized_model.pool2
+        self.conv5 = normalized_model.conv5
+        self.conv6 = normalized_model.conv6
+        self.pool3 = normalized_model.pool3
+        self.global_pool = normalized_model.global_pool
+        self.fc1 = normalized_model.fc1
+        self.fc2 = normalized_model.fc2
+        self.fc3 = normalized_model.fc3
+
+        self.neurons = nn.ModuleDict({name: IFNeuron(th=1.0) for name in ['conv1','conv2','conv3','conv4','conv5','conv6','fc1','fc2']})
+        
+    def forward(self, x_analog, time_steps):
+        mem = {k: 0.0 for k in self.neurons.keys()}
+        mem_out = 0.0
+        outputs = []
+        
+        for t in range(time_steps):
+            x = x_analog 
+            x = self.conv1(x)
+            x, mem['conv1'] = self.neurons['conv1'](x, mem['conv1'])
+            x = self.conv2(x)
+            x, mem['conv2'] = self.neurons['conv2'](x, mem['conv2'])
+            x = self.pool1(x)
+            
+            x = self.conv3(x)
+            x, mem['conv3'] = self.neurons['conv3'](x, mem['conv3'])
+            x = self.conv4(x)
+            x, mem['conv4'] = self.neurons['conv4'](x, mem['conv4'])
+            x = self.pool2(x)
+            
+            x = self.conv5(x)
+            x, mem['conv5'] = self.neurons['conv5'](x, mem['conv5'])
+            x = self.conv6(x)
+            x, mem['conv6'] = self.neurons['conv6'](x, mem['conv6'])
+            x = self.pool3(x)
+            
+            x = self.global_pool(x).squeeze(-1)
+            x = self.fc1(x)
+            x, mem['fc1'] = self.neurons['fc1'](x, mem['fc1'])
+            x = self.fc2(x)
+            x, mem['fc2'] = self.neurons['fc2'](x, mem['fc2'])
+                
+            mem_out += self.fc3(x) 
+            outputs.append(mem_out)
+        return torch.stack(outputs)
+
+
+snn = SNN_Norm(snn_model).to(DEVICE)
+
+
+def inference(model, X_test, time_steps=50, batch_size=32):
+    model.eval()
+    logits = []
+    
+    X_scaled = X_test / input_max
+    
+    print(f"Inference: {len(X_test)} samples, {time_steps} steps")
+    
+    with torch.no_grad():
+        for i in range(0, len(X_test), batch_size):
+            batch = torch.tensor(X_scaled[i:i+batch_size]).float().to(DEVICE)
+            voltage = model(batch, time_steps)
+            
+            # Recover logits
+            final_logits = (voltage[-1].squeeze(-1) / time_steps) * max_activations['fc3']
+            logits.extend(final_logits.cpu().numpy())
+            
+    logits_ = np.array(logits)
+    probs = expit(logits_)
+    return probs
+
+probs = inference(snn, X_test, time_steps=50)
+
+b_acc, b_th, thresholds = 0.0, 0.5, np.arange(0.1, 0.95, 0.05)
+
+for th in thresholds:
+    preds_adj = (probs > th).astype(int)
+    acc = accuracy_score(y_test, preds_adj)
+    
+    if acc > b_acc:
+        b_acc = acc
+        b_th = th
+
+print(f"\nBest Threshold: {b_th:.2f}")
+print(f"Best Accuracy:  {b_acc:.4f}")
+
+final_preds = (probs > b_th).astype(int)
+print("\n=== SNN RESULTS ===")
+print(classification_report(y_test, final_preds, digits=4))
+print(f"ROC AUC: {roc_auc_score(y_test, probs):.4f}")
+
+# %% [markdown]
+# 
+
+# %% [markdown]
+# **STAGE 4- PRUNING*# 
+
+# %%
+import torch
+import torch.nn as nn
+import torch.nn.utils.prune as prune
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+class SeizurePruner:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+
+    def rank_channels(self, data_loader, criterion):
+        print("Calculating Channel Sensitivity (Gradient Based)...")
+        self.model.eval()
+        channel_scores = None
+        limit_batches = 20 
+        
+        for i, (inputs, targets) in enumerate(data_loader):
+            if i >= limit_batches: break
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            inputs.requires_grad_(True)
+            
+            self.model.zero_grad()
+            outputs = self.model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            
+            grads = inputs.grad.abs()
+            batch_scores = grads.sum(dim=(0, 2)).detach().cpu().numpy()
+            
+            if channel_scores is None:
+                channel_scores = batch_scores
+            else:
+                channel_scores += batch_scores
+                
+        return channel_scores / np.max(channel_scores)
+
+    def apply_weight_sparsity(self):
+        print("Applying 2:4 Weight Sparsity...")
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Conv1d, nn.Linear)):
+                w = module.weight.abs().clone()
+                if w.numel() % 4 != 0: continue
+                w_flat = w.view(-1, 4)
+                thresholds, _ = torch.kthvalue(w_flat, k=2, dim=1, keepdim=True)
+                mask = (w_flat > thresholds).float().view_as(module.weight)
+                prune.custom_from_mask(module, name='weight', mask=mask)
+
+    def make_permanent(self):
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Conv1d, nn.Linear)) and prune.is_pruned(module):
+                prune.remove(module, 'weight')
+
+#Execution
+
+print("\n--- Starting Channel Selection ---")
+X_val_t = torch.from_numpy(X_val).float()
+y_val_t = torch.from_numpy(y_val.astype(np.float32))
+val_loader_prune = DataLoader(TensorDataset(X_val_t, y_val_t), batch_size=BATCH_SIZE, shuffle=False)
+
+# Rank Channels
+pruner = SeizurePruner(model, DEVICE)
+scores = pruner.rank_channels(val_loader_prune, nn.BCEWithLogitsLoss())
+
+#Select Top 8 Channels
+top_k_indices = np.argsort(scores)[::-1][:8]
+top_k_indices = sorted(top_k_indices)
+
+# We must update this list so 'train_and_evaluate' builds the correct model size (8 instead of 18).
+#Backup original list
+ORIGINAL_CHANNELS = list(CHANNELS)
+CHANNELS = [ORIGINAL_CHANNELS[i] for i in top_k_indices] 
+
+print(f"\nTop 8 Indices: {top_k_indices}")
+print(f"New Channel List ({len(CHANNELS)}): {CHANNELS}")
+
+#Prune Dataset
+print("\n--- Slicing Data to 8 Channels ---")
+X_train_pruned = X_train[:, top_k_indices, :]
+X_val_pruned   = X_val[:, top_k_indices, :]
+X_test_pruned  = X_test[:, top_k_indices, :]
+
+print(f"New Input Shape: {X_train_pruned.shape}")
+
+#Retrain Model
+print("\n--- Retraining Model on Reduced Input ---")
+pruned_model, history_pruned = train_and_evaluate(
+    X_train_pruned, y_train,
+    X_val_pruned, y_val,
+    X_test_pruned, y_test
+)
+
+# Weight Pruning
+print("\n--- Applying 2:4 Weight Pruning ---")
+final_pruner = SeizurePruner(pruned_model, DEVICE)
+final_pruner.apply_weight_sparsity()
+final_pruner.make_permanent()
+
+save_path = os.path.join(PROCESSED_DIR, "final_Q_SNN_Prune.pth")
+torch.save(pruned_model.state_dict(), save_path)
+print(f"\n Final pruned model saved to: {save_path}")
+
+
+# %%
+
+
+# %% [markdown]
+#### STAGE 5 - QUANTIZATION
 # ---
 ##### 1. DYNAMIC POST-TRAINING QUANTIZATION
 # %% 1. DYNAMIC POST-TRAINING QUANTIZATION
