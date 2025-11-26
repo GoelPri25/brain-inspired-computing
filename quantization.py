@@ -649,6 +649,92 @@ def _save_state_dict_get_size_mb(state_dict, path):
     size_mb = os.path.getsize(path) / (1024.0 * 1024.0)
     return size_mb
 
+
+def _infer_conv_weight_dim(model: nn.Module) -> Optional[int]:
+    """
+    Inspect the first convolution-like module and return its weight.dim() (3 for Conv1d, 4 for Conv2d).
+    Returns None if no convolutional layers are found.
+    """
+    conv2d_types = [
+        nn.Conv2d,
+        getattr(torch.nn.quantized, "Conv2d", None),
+        getattr(torch.ao.nn.quantized, "Conv2d", None),
+    ]
+    # Some FX converted models use intrinsic fused conv+relu types
+    for mod_path in [
+        "torch.ao.nn.intrinsic.quantized",
+        "torch.ao.nn.intrinsic.quantized.modules.conv_relu",
+    ]:
+        try:
+            mod = __import__(mod_path, fromlist=["ConvReLU2d"])
+            cls = getattr(mod, "ConvReLU2d", None)
+            if cls is not None:
+                conv2d_types.append(cls)
+        except Exception:
+            pass
+
+    conv1d_types = [
+        nn.Conv1d,
+        getattr(torch.nn.quantized, "Conv1d", None),
+        getattr(torch.ao.nn.quantized, "Conv1d", None),
+    ]
+    conv2d_types = tuple([c for c in conv2d_types if c is not None])
+    conv1d_types = tuple([c for c in conv1d_types if c is not None])
+
+    for module in model.modules():
+        if isinstance(module, conv2d_types):
+            return 4
+        if isinstance(module, conv1d_types):
+            return 3
+
+        packed = getattr(module, "_packed_params", None)
+        if packed is not None and hasattr(packed, "unpack"):
+            try:
+                w, _ = packed.unpack()
+                if hasattr(w, "dim"):
+                    dim = w.dim()
+                    if dim in (3, 4):
+                        return dim
+            except Exception:
+                pass
+
+        weight = getattr(module, "weight", None)
+        if weight is None or not hasattr(weight, "dim"):
+            continue
+        try:
+            dim = weight.dim()
+        except Exception:
+            continue
+        if dim in (3, 4):
+            return dim
+    return None
+
+
+def _format_tensor_for_model(x: torch.Tensor, model: nn.Module) -> torch.Tensor:
+    """
+    Ensure the input tensor has the expected dimensionality for the model's first conv layer.
+    - Conv1d expects (N, C, T) -> squeeze an extra channel dim if present.
+    - Conv2d expects (N, C, H, W) -> add a channel dim if missing.
+    """
+    conv_dim = _infer_conv_weight_dim(model)
+    if conv_dim == 4 and x.dim() == 3:
+        return x.unsqueeze(1)
+    if conv_dim == 3 and x.dim() == 4 and x.size(1) == 1:
+        return x.squeeze(1)
+    if conv_dim is None and x.dim() == 3:
+        conv1 = getattr(model, "conv1", None)
+        if conv1 is not None and not isinstance(conv1, nn.Conv1d):
+            return x.unsqueeze(1)
+    return x
+
+
+def _example_input_for_model(model: nn.Module, channels: int, time: int) -> torch.Tensor:
+    """Generate a dummy input matching the model's expected rank."""
+    conv_dim = _infer_conv_weight_dim(model)
+    if conv_dim == 4:
+        return torch.randn(1, 1, channels, time)
+    return torch.randn(1, channels, time)
+
 def _predict_model_probs(model, X: np.ndarray, batch_size: int = 64, device: str = "cpu"):
     """
     Run model inference over X and return sigmoid probabilities as a 1D numpy array.
@@ -669,11 +755,12 @@ def _predict_model_probs(model, X: np.ndarray, batch_size: int = 64, device: str
 
     model_dev.eval()
 
-    X_t = torch.from_numpy(X).float().unsqueeze(1)
+    X_t = torch.from_numpy(X).float()
     all_probs = []
     with torch.no_grad():
         for i in range(0, X_t.size(0), batch_size):
-            xb = X_t[i:i+batch_size].to(device)
+            xb = X_t[i:i+batch_size]
+            xb = _format_tensor_for_model(xb, model_dev).to(device)
             try:
                 logits = model_dev(xb)
             except Exception:
@@ -736,7 +823,8 @@ def measure_avg_inference_time(model, X: np.ndarray, n_repeats: int = 3, device:
 
     model_dev.eval()
 
-    X_t = torch.from_numpy(X).float().unsqueeze(1).to(device)
+    X_t = torch.from_numpy(X).float()
+    X_t = _format_tensor_for_model(X_t, model_dev).to(device)
     n_samples = X_t.size(0)
 
     total_per_sample = 0.0
@@ -1040,7 +1128,8 @@ print(f"FP32 avg inference time: {fp32_time*1000:.2f} ms")
 print(f"FP32 ROC AUC: {fp32_auc}")
 
 # %% [markdown]
-# # Stage 3 — SNN conversion & inference
+#### Stage 3 — SNN conversion & inference
+# ---
 
 # %%
 baseline = EEGCNN(in_channels=len(CHANNELS))
@@ -1084,7 +1173,7 @@ with torch.no_grad():
     for name in layer_names:
         layer = dict(snn_model.named_modules())[name]
         curr_max = max_activations[name]
- 
+
         layer.weight.data *= prev_max / curr_max
         if layer.bias is not None:
             layer.bias.data *= 1.0 / curr_max
@@ -1201,10 +1290,9 @@ print(classification_report(y_test, final_preds, digits=4))
 print(f"ROC AUC: {roc_auc_score(y_test, probs):.4f}")
 
 # %% [markdown]
-# 
-
-# %% [markdown]
-# **STAGE 4- PRUNING*# 
+#### STAGE 4- PRUNING
+# ---
+##### 4.1 CHANNEL PRUNING & 2:4 WEIGHT SPARSITY
 
 # %%
 import torch
@@ -1309,9 +1397,6 @@ final_pruner.make_permanent()
 save_path = os.path.join(PROCESSED_DIR, "final_Q_SNN_Prune.pth")
 torch.save(pruned_model.state_dict(), save_path)
 print(f"\n Final pruned model saved to: {save_path}")
-
-
-# %%
 
 
 # %% [markdown]
@@ -1490,7 +1575,7 @@ torch.backends.quantized.engine = "fbgemm"
 def get_calibration_loader_eager(X, batch_size=32, n_samples=512):
     """Small subset of training data for calibration."""
     idx = np.random.choice(len(X), size=min(n_samples, len(X)), replace=False)
-    X_cal = torch.from_numpy(X[idx]).float().unsqueeze(1)  # (N,1,C,T)
+    X_cal = torch.from_numpy(X[idx]).float()
     dummy_y = torch.zeros(len(X_cal))  # labels not needed
     ds = TensorDataset(X_cal, dummy_y)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
@@ -1538,7 +1623,7 @@ tq.prepare(eager_quant_model, inplace=True)
 print("Running calibration over subset of training data...")
 with torch.no_grad():
     for xb, _ in calib_loader_eager:
-        xb = xb.to("cpu")
+        xb = _format_tensor_for_model(xb, eager_quant_model).to("cpu")
         _ = eager_quant_model(xb)
 
 # -----------------------------
@@ -1579,7 +1664,7 @@ if os.path.exists(int8_static_eager_path):
         print("Running calibration over subset of training data...")
         with torch.no_grad():
             for xb, _ in calib_loader_eager:
-                xb = xb.to("cpu")
+                xb = _format_tensor_for_model(xb, eager_quant_model).to("cpu")
                 _ = eager_quant_model(xb)
         model_int8_static_eager = tq.convert(eager_quant_model, inplace=False).eval()
         int8_static_eager_size = _save_state_dict_get_size_mb(
@@ -1617,7 +1702,7 @@ print("Starting Static FX Quantization Comparison...")
 # -----------------------------
 def get_calibration_loader(X, batch_size=32, n_samples=512):
     idx = np.random.choice(len(X), size=min(n_samples, len(X)), replace=False)
-    X_cal = torch.from_numpy(X[idx]).float().unsqueeze(1)
+    X_cal = torch.from_numpy(X[idx]).float()
     dummy_y = torch.zeros(len(X_cal))
     ds = TensorDataset(X_cal, dummy_y)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
@@ -1628,12 +1713,13 @@ model_static = copy.deepcopy(model_fp32).cpu().eval()
 
 qconfig = get_default_qconfig_mapping("fbgemm")   # CPU int8 quantization backend
 
-example_input = torch.randn(1, 1, X_train.shape[1], X_train.shape[2])
+example_input = _example_input_for_model(model_static, X_train.shape[1], X_train.shape[2])
 prepared_model = prepare_fx(model_static, qconfig, example_inputs=example_input)
 
 print("Running calibration over sample training data...")
 with torch.no_grad():
     for xb, _ in calibration_loader:
+        xb = _format_tensor_for_model(xb, prepared_model)
         prepared_model(xb)
 
 model_int8_static = convert_fx(prepared_model)
@@ -1675,7 +1761,7 @@ else:
     # 1. Build train dataloader for QAT
     # -----------------------------
     def get_qat_train_loader(X, y, batch_size=128):
-        X_t = torch.from_numpy(X).float().unsqueeze(1)  # (N,1,C,T)
+        X_t = torch.from_numpy(X).float()
         y_t = torch.from_numpy(y.astype(np.float32))
         ds = TensorDataset(X_t, y_t)
         return DataLoader(ds, batch_size=batch_size, shuffle=True)
@@ -1700,7 +1786,7 @@ else:
         # Older API fallback (unlikely, but just in case)
         qat_qconfig_mapping = {"": get_default_qat_qconfig("fbgemm")}
 
-    example_input = torch.randn(1, 1, X_train.shape[1], X_train.shape[2])
+    example_input = _example_input_for_model(model_fp32_for_qat, X_train.shape[1], X_train.shape[2])
 
     # Prepare QAT graph
     model_qat_prepared = prepare_qat_fx(
@@ -1739,7 +1825,7 @@ else:
             total = 0
 
             for xb, yb in qat_train_loader:
-                xb = xb.to(device_qat)
+                xb = _format_tensor_for_model(xb, model_qat).to(device_qat)
                 yb = yb.to(device_qat)
 
                 optimizer.zero_grad()
@@ -1759,7 +1845,7 @@ else:
             val_total = 0
             with torch.no_grad():
                 for xb, yb in qat_val_loader:
-                    xb = xb.to(device_qat)
+                    xb = _format_tensor_for_model(xb, model_qat).to(device_qat)
                     yb = yb.to(device_qat)
                     logits = model_qat(xb)
                     loss = criterion(logits, yb)
@@ -1848,12 +1934,18 @@ onnx_int8_dynamic_path = os.path.join(PROCESSED_DIR, "seizure_cnn_int8_dynamic.o
 onnx_int8_static_path = os.path.join(PROCESSED_DIR, "seizure_cnn_int8_static.onnx")
 
 fp32_onnx_available = os.path.exists(onnx_fp32_path)
+onnx_input_rank = None
+if fp32_onnx_available:
+    try:
+        onnx_input_rank = len(onnx.load(onnx_fp32_path).graph.input[0].type.tensor_type.shape.dim)
+    except Exception:
+        onnx_input_rank = None
 
 if not fp32_onnx_available:
     if model_fp32 is None:
         logging.warning("Skipping ONNX export: FP32 model not available and no cached ONNX file found.")
     else:
-        dummy = torch.randn(1, 1, X_train.shape[1], X_train.shape[2]).cpu()
+        dummy = _example_input_for_model(model_fp32, X_train.shape[1], X_train.shape[2]).cpu()
         print("Exporting FP32 model to ONNX (opset 18)")
         torch.onnx.export(
             model_fp32.cpu(),
@@ -1867,6 +1959,10 @@ if not fp32_onnx_available:
             dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
         )
         fp32_onnx_available = True
+        try:
+            onnx_input_rank = len(onnx.load(onnx_fp32_path).graph.input[0].type.tensor_type.shape.dim)
+        except Exception:
+            onnx_input_rank = None
         print("Saved ONNX:", onnx_fp32_path)
 else:
     print(f"Found cached FP32 ONNX model at {onnx_fp32_path}")
@@ -1876,10 +1972,14 @@ else:
 # ============================================================
 
 def onnx_predict(sess, X, batch=32):
-    name = sess.get_inputs()[0].name
+    input_meta = sess.get_inputs()[0]
+    input_rank = len(input_meta.shape)
+    name = input_meta.name
     outs = []
     for i in range(0, len(X), batch):
-        xb = X[i:i+batch][:, None, :, :].astype(np.float32)
+        xb = X[i:i+batch].astype(np.float32)
+        if input_rank == 4:
+            xb = xb[:, None, :, :]
         logits = sess.run(None, {name: xb})[0]
         logits = np.clip(logits, -30, 30)
         outs.append(1 / (1 + np.exp(-logits)))
@@ -1954,18 +2054,22 @@ if dyn_onnx_available:
 static_onnx_available = os.path.exists(onnx_int8_static_path)
 
 class EEGCalibReader(CalibrationDataReader):
-    def __init__(self, X, max_samples=512, bs=32):
+    def __init__(self, X, max_samples=512, bs=32, input_rank: Optional[int] = None):
         idx = np.random.choice(len(X), min(max_samples, len(X)), replace=False)
         self.data = X[idx]
         self.bs   = bs
         self.ptr  = 0
+        self.input_rank = input_rank
 
     def get_next(self):
         if self.ptr >= len(self.data):
             return None
         b = self.data[self.ptr:self.ptr+self.bs]
         self.ptr += self.bs
-        return {"input": b[:, None, :, :].astype(np.float32)}
+        xb = b.astype(np.float32)
+        if self.input_rank == 4:
+            xb = xb[:, None, :, :]
+        return {"input": xb}
 
 if static_onnx_available:
     print(f"Using cached Static INT8 ONNX model at {onnx_int8_static_path}")
@@ -1974,7 +2078,7 @@ elif fp32_onnx_available:
     quantize_static(
         model_input=onnx_fp32_path,
         model_output=onnx_int8_static_path,
-        calibration_data_reader=EEGCalibReader(X_train),
+        calibration_data_reader=EEGCalibReader(X_train, input_rank=onnx_input_rank),
         quant_format="QDQ",
         weight_type=QuantType.QInt8,
         activation_type=QuantType.QInt8,
@@ -1998,8 +2102,12 @@ if static_onnx_available:
 
 def onnx_bench(path, X, reps=2):
     sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-    name = sess.get_inputs()[0].name
-    xb = X[:128][:, None, :, :].astype(np.float32)
+    input_meta = sess.get_inputs()[0]
+    input_rank = len(input_meta.shape)
+    name = input_meta.name
+    xb = X[:128].astype(np.float32)
+    if input_rank == 4:
+        xb = xb[:, None, :, :]
     t = []
     for _ in range(reps):
         s = time.time()
@@ -2166,7 +2274,7 @@ torch.backends.quantized.engine = "fbgemm"
 qconfig = get_default_qconfig_mapping("fbgemm")
 
 # 4. Example input for FX graph tracing
-example_input = torch.randn(1, 1, X_train.shape[1], X_train.shape[2])
+example_input = _example_input_for_model(model_fx, X_train.shape[1], X_train.shape[2])
 
 # 5. Prepare model
 print("Preparing model (FX prepare)...")
@@ -2176,6 +2284,7 @@ prepared_fx_model = prepare_fx(model_fx, qconfig, example_inputs=example_input)
 print("Running calibration...")
 with torch.no_grad():
     for xb, _ in calibration_loader:
+        xb = _format_tensor_for_model(xb, prepared_fx_model)
         prepared_fx_model(xb)  # just forward pass
 
 # 7. Convert to INT8
@@ -2200,6 +2309,7 @@ def _model_size_mb(path):
     return os.path.getsize(path) / (1024 * 1024)
 
 fused_int8_path = os.path.join(PROCESSED_DIR, "model_int8_fused_fx_state.pth")
+os.makedirs(PROCESSED_DIR, exist_ok=True)
 torch.save(model_int8_fx.state_dict(), fused_int8_path)
 fused_static_mb = _model_size_mb(fused_int8_path)
 
@@ -2219,12 +2329,30 @@ print("Fused QAT (EEGCNN_Q) QUANTIZATION\n")
 
 print("Running Fused QAT (EEGCNN_Q)...")
 
+def _load_matching_weights(target: nn.Module, source_state: dict):
+    """
+    Load only parameters whose names and shapes match between target and source.
+    Returns (loaded_keys, skipped_keys).
+    """
+    target_state = target.state_dict()
+    compatible = {
+        k: v
+        for k, v in source_state.items()
+        if k in target_state and target_state[k].shape == v.shape
+    }
+    skipped = [k for k in source_state.keys() if k not in compatible]
+    missing = [k for k in target_state.keys() if k not in compatible]
+    target_state.update(compatible)
+    target.load_state_dict(target_state)
+    return compatible.keys(), {"skipped_source": skipped, "missing_target": missing}
+
+
 # 1. Create fused model
 model_q_fused = EEGCNN_Q().cpu().eval()
 
 # Load FP32 pretrained weights
-missing, unexpected = model_q_fused.load_state_dict(model_fp32.state_dict(), strict=False)
-print("Weight transfer:", missing, unexpected)
+loaded, info = _load_matching_weights(model_q_fused, model_fp32.state_dict())
+print("Weight transfer (matching only). Loaded keys:", len(list(loaded)), "Skipped:", info)
 
 # Fuse Conv+ReLU and FC+ReLU
 model_q_fused.fuse_model()
@@ -2233,7 +2361,7 @@ print("Model fused ✓")
 # 2. Prepare QAT config
 qat_qconfig = get_default_qat_qconfig_mapping("fbgemm")
 
-example_input = torch.randn(1, 1, X_train.shape[1], X_train.shape[2])
+example_input = _example_input_for_model(model_q_fused, X_train.shape[1], X_train.shape[2])
 model_qat_fused_prepared = prepare_qat_fx(model_q_fused, qat_qconfig, example_inputs=example_input)
 
 # 3. Train (light QAT, 5–20 epochs)
@@ -2252,7 +2380,8 @@ for epoch in range(QAT_FUSED_EPOCHS):
     train_samples = 0
 
     for xb, yb in qat_train_loader:
-        xb, yb = xb.to(device), yb.to(device)
+        xb = _format_tensor_for_model(xb, model_qat_fused_prepared).to(device)
+        yb = yb.to(device)
 
         optimizer.zero_grad()
         logits = model_qat_fused_prepared(xb)
@@ -2271,7 +2400,8 @@ for epoch in range(QAT_FUSED_EPOCHS):
     val_samples = 0
     with torch.no_grad():
         for xb, yb in qat_val_loader:
-            xb, yb = xb.to(device), yb.to(device)
+            xb = _format_tensor_for_model(xb, model_qat_fused_prepared).to(device)
+            yb = yb.to(device)
             logits = model_qat_fused_prepared(xb)
             loss = criterion(logits, yb)
             val_running_loss += loss.item() * xb.size(0)
