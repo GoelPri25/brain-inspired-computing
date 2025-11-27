@@ -43,7 +43,7 @@ pd.set_option("display.expand_frame_repr", False)
 
 
 # %% [markdown]
-# ### 1. CONFIGURATION
+# ### CONFIGURATION
 # ---
 
 # %%
@@ -64,6 +64,8 @@ CHANNELS = [
     "FP2-F8", "F8-T8", "T8-P8-1", "P8-O2",
     "FZ-CZ", "CZ-PZ",
 ]
+ORIGINAL_CHANNELS = list(CHANNELS)
+
 # Windowing parameters
 TIME_WINDOW = 8.0   # seconds per segment
 TIME_STEP = 4.0     # seconds between segment starts
@@ -92,7 +94,7 @@ EPOCHS = 200
 EARLY_STOPPING_PATIENCE = 20
 
 # %% [markdown]
-# ### 2. SETUP & UTILITIES 
+# ### SETUP & UTILITIES 
 # ---
 
 # %%
@@ -151,9 +153,9 @@ def processed_files_exist(processed_dir):
     return all(os.path.exists(os.path.join(processed_dir, f)) for f in required)
 
 # %% [markdown]
-# ### 3. Data Processing 
+# # Stage 1: Data Processing
 # ---
-# #### 3.1 SEIZURE ANNOTATIONS
+# #### 1.1 SEIZURE ANNOTATIONS
 # %%
 def load_seizure_mask(edf_path: str, n_samples: int, fs: float) -> np.ndarray:
     """
@@ -195,7 +197,7 @@ def load_seizure_mask(edf_path: str, n_samples: int, fs: float) -> np.ndarray:
 
 # %% [markdown]
 # ---
-# #### 3.2 PER-FILE WINDOWING 
+# #### 1.2 PER-FILE WINDOWING 
 # %%
 def process_file_to_windows(
     edf_path: str,
@@ -305,7 +307,7 @@ def process_file_to_windows(
 
 # %% [markdown]
 # ---
-#  #### 3.3 DATASET BUILDING
+#  #### 1.3 DATASET BUILDING
 # %%
 def build_dataset_from_files(files: List[str]) -> Tuple[np.ndarray, np.ndarray, float]:
     """
@@ -350,7 +352,7 @@ def build_dataset_from_files(files: List[str]) -> Tuple[np.ndarray, np.ndarray, 
 # # Stage 2: Baseline creation
 
 # %% [markdown]
-# ### 4. MODEL DEFINITION 
+# #### 2.1. MODEL DEFINITION 
 # ---
 class EEGCNN(nn.Module):
     """
@@ -406,7 +408,7 @@ class EEGCNN(nn.Module):
         return x.squeeze(1)
 
 # %% [markdown]
-# ### 5. TRAINING & EVALUATION 
+# ### 2.2. TRAINING & EVALUATION 
 # ---
 
 # %%
@@ -637,7 +639,7 @@ def train_and_evaluate(
 
 
 # %% [markdown]
-#  ### 6. MAIN PIPELINE
+#  ### 2.3. MAIN PIPELINE
 #  ---
 # %% 0. config & setup
 # 0. config & setup
@@ -1128,7 +1130,7 @@ print(f"FP32 avg inference time: {fp32_time*1000:.2f} ms")
 print(f"FP32 ROC AUC: {fp32_auc}")
 
 # %% [markdown]
-#### Stage 3 — SNN conversion & inference
+# # Stage 3 — SNN conversion & inference
 # ---
 
 # %%
@@ -1244,9 +1246,7 @@ class SNN_Norm(nn.Module):
             outputs.append(mem_out)
         return torch.stack(outputs)
 
-
 snn = SNN_Norm(snn_model).to(DEVICE)
-
 
 def inference(model, X_test, time_steps=50, batch_size=32):
     model.eval()
@@ -1290,7 +1290,7 @@ print(classification_report(y_test, final_preds, digits=4))
 print(f"ROC AUC: {roc_auc_score(y_test, probs):.4f}")
 
 # %% [markdown]
-#### STAGE 4- PRUNING
+# # STAGE 4- PRUNING
 # ---
 ##### 4.1 CHANNEL PRUNING & 2:4 WEIGHT SPARSITY
 
@@ -1350,7 +1350,6 @@ class SeizurePruner:
                 prune.remove(module, 'weight')
 
 #Execution
-
 print("\n--- Starting Channel Selection ---")
 X_val_t = torch.from_numpy(X_val).float()
 y_val_t = torch.from_numpy(y_val.astype(np.float32))
@@ -1366,8 +1365,8 @@ top_k_indices = sorted(top_k_indices)
 
 # We must update this list so 'train_and_evaluate' builds the correct model size (8 instead of 18).
 #Backup original list
-ORIGINAL_CHANNELS = list(CHANNELS)
 CHANNELS = [ORIGINAL_CHANNELS[i] for i in top_k_indices] 
+PRUNED_CHANNELS = CHANNELS.copy()
 
 print(f"\nTop 8 Indices: {top_k_indices}")
 print(f"New Channel List ({len(CHANNELS)}): {CHANNELS}")
@@ -1378,76 +1377,119 @@ X_train_pruned = X_train[:, top_k_indices, :]
 X_val_pruned   = X_val[:, top_k_indices, :]
 X_test_pruned  = X_test[:, top_k_indices, :]
 
-print(f"New Input Shape: {X_train_pruned.shape}")
-
 #Retrain Model
+channel_sparse_path = os.path.join(PROCESSED_DIR, "channel_sparse_Q_SNN_Prune.pth")
 print("\n--- Retraining Model on Reduced Input ---")
-pruned_model, history_pruned = train_and_evaluate(
-    X_train_pruned, y_train,
-    X_val_pruned, y_val,
-    X_test_pruned, y_test
-)
+if os.path.exists(channel_sparse_path):
+    print(f"Model exists loading from {channel_sparse_path}")
+    pruned_model = EEGCNN(in_channels=len(CHANNELS)).to(DEVICE)
+    state = torch.load(channel_sparse_path, map_location=DEVICE)
+    pruned_model.load_state_dict(state)
+    pruned_model.eval()
+else:
+    print(f"New Input Shape: {X_train_pruned.shape}")
+    pruned_model, history_pruned = train_and_evaluate(
+        X_train_pruned, y_train,
+        X_val_pruned, y_val,
+        X_test_pruned, y_test
+    )
+    torch.save(pruned_model.state_dict(), channel_sparse_path)
+pre_sparse_model = copy.deepcopy(pruned_model).cpu().eval()
 
 # Weight Pruning
-print("\n--- Applying 2:4 Weight Pruning ---")
-final_pruner = SeizurePruner(pruned_model, DEVICE)
-final_pruner.apply_weight_sparsity()
-final_pruner.make_permanent()
+print("\n--- Applying 2:4 Weight Pruning (Masked) ---")
 
+# Apply pruning BUT DO NOT remove()
+final_pruner = SeizurePruner(pruned_model, DEVICE)
+final_pruner.apply_weight_sparsity()   # attaches weight_orig + weight_mask
+
+# Create DataLoader for 8-channel reduced dataset
+train_ds_pruned = TensorDataset(
+    torch.from_numpy(X_train_pruned).float(),
+    torch.from_numpy(y_train.astype(np.float32))
+)
+train_loader_pruned = DataLoader(train_ds_pruned, batch_size=BATCH_SIZE, shuffle=True)
+
+criterion = nn.BCEWithLogitsLoss()
+optimizer = torch.optim.Adam(pruned_model.parameters(), lr=1e-4)
+epochs = 100
+
+# -------------------------------
+# MASKED RETRAINING LOOP
+# -------------------------------
+pruned_model.train()
+for epoch in range(epochs):
+    running_loss = 0.0
+    for xb, yb in train_loader_pruned:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+
+        optimizer.zero_grad()
+        logits = pruned_model(xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+
+        # ✨ RE-APPLY MASK — ensure zeros stay zero
+        for name, module in pruned_model.named_modules():
+            if hasattr(module, "weight_mask"):
+                module.weight_orig.data *= module.weight_mask
+
+        running_loss += loss.item()
+
+    print(f"Masked retraining epoch {epoch+1}/{epochs} - loss: {running_loss:.4f}")
+
+# ----------------------------------------
+# Make pruning PERMANENT only after training
+# ----------------------------------------
+print("Finalizing sparse model (making pruning permanent)...")
+
+for name, module in pruned_model.named_modules():
+    if hasattr(module, "weight_mask"):
+        prune.remove(module, "weight")
+
+# Save final sparse model
 save_path = os.path.join(PROCESSED_DIR, "final_Q_SNN_Prune.pth")
 torch.save(pruned_model.state_dict(), save_path)
 print(f"\n Final pruned model saved to: {save_path}")
 
 
-# %% [markdown]
-#### STAGE 5 - QUANTIZATION
-# ---
-##### 1. DYNAMIC POST-TRAINING QUANTIZATION
-# %% 1. DYNAMIC POST-TRAINING QUANTIZATION
-# 1. DYNAMIC POST-TRAINING QUANTIZATION
-print("\n------------------------------------------------------------------------------------------------------------------------")
-print("DYNAMIC POST-TRAINING QUANTIZATION\n")
-int8_dyn_state_path = os.path.join(PROCESSED_DIR, "model_int8_dynamic_state.pth")
+#%% 3. Calculating Pruned model size, inference time, and performance
+model_pruned = pre_sparse_model
+pruned_size = _save_state_dict_get_size_mb(model_pruned.state_dict(), channel_sparse_path)
 
-# --- Apply or load dynamic quantization (quantize Linear layers) ---
-if os.path.exists(int8_dyn_state_path):
-    print(f"Loading Dynamic INT8 state dict from {int8_dyn_state_path}")
-    # create same quantized model structure then load saved state_dict
-    model_int8_dynamic = torch.quantization.quantize_dynamic(
-        copy.deepcopy(model_fp32),
-        {nn.Linear},
-        dtype=torch.qint8
-    )
-    try:
-        state = torch.load(int8_dyn_state_path, map_location="cpu")
-        model_int8_dynamic.load_state_dict(state)
-        int8_dyn_size = os.path.getsize(int8_dyn_state_path) / (1024.0 * 1024.0)
-    except Exception as e:
-        logging.warning(f"Failed to load dynamic INT8 state from {int8_dyn_state_path}: {e}")
-        # fallback: recreate quantized model and overwrite state file
-        model_int8_dynamic = torch.quantization.quantize_dynamic(
-            copy.deepcopy(model_fp32),
-            {nn.Linear},
-            dtype=torch.qint8
-        )
-        int8_dyn_size = _save_state_dict_get_size_mb(model_int8_dynamic.state_dict(), int8_dyn_state_path)
-else:
-    # File doesn't exist: quantize and save
-    model_int8_dynamic = torch.quantization.quantize_dynamic(
-        copy.deepcopy(model_fp32),
-        {nn.Linear},
-        dtype=torch.qint8
-    )
-    int8_dyn_size = _save_state_dict_get_size_mb(model_int8_dynamic.state_dict(), int8_dyn_state_path)
+# --- Evaluate FP32 performance (AUC) ---
+print("Evaluating Pruned model (CPU)...")
+model_pruned.eval()
+pruned_auc = evaluate_model_torch(model_pruned, X_test_pruned, y_test, device="cpu")
 
-# --- Measure INT8 inference time (quantized models run on CPU) ---
-print("Evaluating Dynamic INT8 model (CPU)...")
-int8_dyn_time = measure_avg_inference_time(model_int8_dynamic, X_test, n_repeats=2, device='cpu')
-
-# --- Evaluate INT8 dynamic performance (AUC) ---
+# --- Measure Pruned time ---
 print("Running inference speed comparison (CPU)...")
-int8_dyn_auc = evaluate_model_torch(model_int8_dynamic, X_test, y_test, device='cpu')
+pruned_time = measure_avg_inference_time(model_pruned, X_test_pruned, n_repeats=2)
 
+# --- Print Pruned results ---
+print(f"PRUNED model size: {pruned_size:.2f} MB")
+print(f"PRUNED avg inference time: {pruned_time*1000:.2f} ms")
+print(f"PRUNED ROC AUC: {pruned_auc}")
+
+model_pruned = pruned_model
+pruned_size = _save_state_dict_get_size_mb(model_pruned.state_dict(), channel_sparse_path)
+
+# --- Evaluate FP32 performance (AUC) ---
+print("Evaluating Pruned model (CPU)...")
+model_pruned.eval()
+pruned_auc = evaluate_model_torch(model_pruned, X_test_pruned, y_test, device="cpu")
+
+# --- Measure Pruned time ---
+print("Running inference speed comparison (CPU)...")
+pruned_time = measure_avg_inference_time(model_pruned, X_test_pruned, n_repeats=2)
+
+# --- Print Pruned results ---
+print(f"PRUNED model size: {pruned_size:.2f} MB")
+print(f"PRUNED avg inference time: {pruned_time*1000:.2f} ms")
+print(f"PRUNED ROC AUC: {pruned_auc}")
+
+#%% Results logging and reporting
+# Results logging and reporting
 RESULT_COLUMNS = [
     "Model",
     "Size (MB)",
@@ -1455,6 +1497,7 @@ RESULT_COLUMNS = [
     "Compression (%)",
     "Inference time (ms)",
     "Speedup Δ%",
+    "AUC",
     "AUC drop",
     "AUC Δ%"
 ] + CLASS_COLUMNS
@@ -1526,6 +1569,7 @@ def add(name, model=None, size=None, inference_time=None, metrics=None, eval_dev
         "Compression (%)": round(compression_pct, 2) if compression_pct is not None else None,
         "Inference time (ms)": inference_ms,
         "Speedup Δ%": pct(speed_pct),
+        "AUC": round(test_auc, 6) if test_auc is not None else None,
         "AUC drop": round(auc_drop, 6) if auc_drop is not None else None,
         "AUC Δ%": pct(acc_pct)
     }
@@ -1551,6 +1595,35 @@ def add(name, model=None, size=None, inference_time=None, metrics=None, eval_dev
         results_df.loc[0] = row
     else:
         results_df.loc[len(results_df)] = row
+
+# %% [markdown]
+# # STAGE 5 - QUANTIZATION
+# ---
+##### 5.1. DYNAMIC POST-TRAINING QUANTIZATION
+# %% 5.1. DYNAMIC POST-TRAINING QUANTIZATION
+# 5.1. DYNAMIC POST-TRAINING QUANTIZATION
+print("\n------------------------------------------------------------------------------------------------------------------------")
+print("DYNAMIC POST-TRAINING QUANTIZATION\n")
+int8_dyn_state_path = os.path.join(PROCESSED_DIR, "model_int8_dynamic_state.pth")
+int8_dyn_state_path_pruned = os.path.join(PROCESSED_DIR, "model_int8_dynamic_state_pruned.pth")
+CHANNELS = ORIGINAL_CHANNELS  # Reset CHANNELS to original for quantization eval
+# File doesn't exist: quantize and save
+model_int8_dynamic = torch.quantization.quantize_dynamic(
+    copy.deepcopy(model_fp32),
+    {nn.Linear},
+    dtype=torch.qint8
+)
+
+int8_dyn_size = _save_state_dict_get_size_mb(model_int8_dynamic.state_dict(), int8_dyn_state_path)
+
+# --- Measure INT8 inference time (quantized models run on CPU) ---
+print("Evaluating Dynamic INT8 model (CPU)...")
+int8_dyn_time = measure_avg_inference_time(model_int8_dynamic, X_test, n_repeats=2, device='cpu')
+
+# --- Evaluate INT8 dynamic performance (AUC) ---
+print("Running inference speed comparison (CPU)...")
+int8_dyn_auc = evaluate_model_torch(model_int8_dynamic, X_test, y_test, device='cpu')
+
 # --- Record results ---
 add("FP32", model=model_fp32, size=fp32_size, inference_time=fp32_time)
 add("Dynamic INT8", model=model_int8_dynamic, size=int8_dyn_size, inference_time=int8_dyn_time)
@@ -1560,139 +1633,132 @@ results_df
 
 # %% [markdown]
 # ---
-##### 2. STATIC (EAGER) POST-TRAINING QUANTIZATION
-# %% 2. STATIC (EAGER) POST-TRAINING QUANTIZATION
-# 2. STATIC (EAGER) POST-TRAINING QUANTIZATION
+##### 5.2. STATIC (EAGER) POST-TRAINING QUANTIZATION
+# %% 5.2. STATIC (EAGER) POST-TRAINING QUANTIZATION
+# 5.2. STATIC (EAGER) POST-TRAINING QUANTIZATION
 print("\n------------------------------------------------------------------------------------------------------------------------")
 print("STATIC (EAGER) POST-TRAINING QUANTIZATION\n")
 
-# Use fbgemm backend for x86 CPUs
 torch.backends.quantized.engine = "fbgemm"
 
-# -----------------------------
-# 1. Calibration DataLoader
-# -----------------------------
-def get_calibration_loader_eager(X, batch_size=32, n_samples=512):
-    """Small subset of training data for calibration."""
-    idx = np.random.choice(len(X), size=min(n_samples, len(X)), replace=False)
-    X_cal = torch.from_numpy(X[idx]).float()
-    dummy_y = torch.zeros(len(X_cal))  # labels not needed
-    ds = TensorDataset(X_cal, dummy_y)
-    return DataLoader(ds, batch_size=batch_size, shuffle=False)
+# ----------------------------- # 1. Calibration DataLoader # ----------------------------- 
+def get_calibration_loader_eager(X, batch_size=32, n_samples=512): 
+    """Small subset of training data for calibration.""" 
+    idx = np.random.choice(len(X), size=min(n_samples, len(X)), replace=False) 
+    X_cal = torch.from_numpy(X[idx]).float() 
+    dummy_y = torch.zeros(len(X_cal)) # labels not needed 
+    ds = TensorDataset(X_cal, dummy_y) 
+    return DataLoader(ds, batch_size=batch_size, shuffle=False) 
 
-calib_loader_eager = get_calibration_loader_eager(X_train)
+calib_loader_eager = get_calibration_loader_eager(X_train) 
 
-# -----------------------------
-# 2. Wrapper with QuantStub / DeQuantStub
-# -----------------------------
-class QuantWrapper(nn.Module):
-    """
-    Wraps an existing float model with QuantStub and DeQuantStub
-    so we can use eager static quantization without touching EEGCNN.
-    """
-    def __init__(self, float_model: nn.Module):
-        super().__init__()
-        self.quant = tq.QuantStub()
-        self.model = float_model
-        self.dequant = tq.DeQuantStub()
-
-    def forward(self, x):
-        x = self.quant(x)
-        x = self.model(x)
+# ----------------------------- 
+# 2. Wrapper with QuantStub / DeQuantStub 
+# ----------------------------- 
+class QuantWrapper(nn.Module): 
+    """ Wraps an existing float model with QuantStub and DeQuantStub so we can use eager static quantization without touching EEGCNN. """ 
+    def __init__(self, float_model: nn.Module): 
+        super().__init__() 
+        self.quant = tq.QuantStub() 
+        self.model = float_model 
+        self.dequant = tq.DeQuantStub() 
+    
+    def forward(self, x): 
+        x = self.quant(x) 
+        x = self.model(x) 
         x = self.dequant(x)
         return x
 
-# Start from baseline FP32 model
-float_model_for_q = copy.deepcopy(model_fp32).cpu().eval()
 
-# Wrap with QuantStub/DeQuantStub
-eager_quant_model = QuantWrapper(float_model_for_q).cpu().eval()
+# ============================================================
+# HELPER: Build, calibrate, convert, save, evaluate
+# ============================================================
+def run_static_eager_quantization(
+    float_model,
+    X_train_data,
+    X_test_data,
+    y_test_data,
+    name_suffix
+):
+    """
+    Performs:
+    - Wrap model in QuantStub/DeQuantStub
+    - prepare()
+    - calibration
+    - convert()
+    - save .pth
+    - evaluate/duration
+    - returns metrics + updates results_df via add()
+    """
 
-# -----------------------------
-# 3. Assign qconfig and prepare
-# -----------------------------
-# Default per-tensor int8 config for static quantization (fbgemm backend)
-eager_quant_model.qconfig = tq.get_default_qconfig("fbgemm")
+    print(f"\n===== Static Eager Quantization: {name_suffix} =====")
 
-print("Preparing model for eager static quantization...")
-tq.prepare(eager_quant_model, inplace=True)
+    # Calibration loader (subset of training data)
+    calib_loader = get_calibration_loader_eager(X_train_data)
 
-# -----------------------------
-# 4. Calibration (run some real data through)
-# -----------------------------
-print("Running calibration over subset of training data...")
-with torch.no_grad():
-    for xb, _ in calib_loader_eager:
-        xb = _format_tensor_for_model(xb, eager_quant_model).to("cpu")
-        _ = eager_quant_model(xb)
+    # Wrap in Q/DQ stubs
+    float_cp = copy.deepcopy(float_model).cpu().eval()
+    eager_model = QuantWrapper(float_cp).cpu().eval()
 
-# -----------------------------
-# 5. Convert to quantized model
-# -----------------------------
-print("Converting to quantized int8 model (eager)...")
-model_int8_static_eager = tq.convert(eager_quant_model, inplace=False).eval()
+    # QConfig
+    eager_model.qconfig = tq.get_default_qconfig("fbgemm")
 
-print("Eager static quantization done.")
+    # Prepare
+    print("Preparing model...")
+    tq.prepare(eager_model, inplace=True)
 
-# -----------------------------
-# 6. Save model & compare size (load if exists)
-# -----------------------------
-int8_static_eager_path = os.path.join(PROCESSED_DIR, "model_int8_static_eager_state.pth")
+    # Calibration
+    print("Calibrating model...")
+    with torch.no_grad():
+        for xb, _ in calib_loader:
+            xb = _format_tensor_for_model(xb, eager_model).to("cpu")
+            _ = eager_model(xb)
 
-# If a saved eager static state_dict exists, try to load it into a converted
-# model instance. Otherwise perform conversion and save the state_dict.
-if os.path.exists(int8_static_eager_path):
-    print(f"Loading Static Eager INT8 state dict from {int8_static_eager_path}")
-    try:
-        # Recreate the converted model structure (may skip calibration)
-        float_model_for_q = copy.deepcopy(model_fp32).cpu().eval()
-        eager_quant_model = QuantWrapper(float_model_for_q).cpu().eval()
-        eager_quant_model.qconfig = tq.get_default_qconfig("fbgemm")
-        # Prepare and convert (without a full calibration pass) to obtain
-        # the quantized module structure; then load saved params.
-        tq.prepare(eager_quant_model, inplace=True)
-        model_int8_static_eager = tq.convert(eager_quant_model, inplace=False).eval()
+    # Convert
+    print("Converting to INT8...")
+    model_int8 = tq.convert(eager_model, inplace=False).eval()
 
-        state = torch.load(int8_static_eager_path, map_location="cpu")
-        model_int8_static_eager.load_state_dict(state)
-        int8_static_eager_size = os.path.getsize(int8_static_eager_path) / (1024.0 * 1024.0)
-    except Exception as e:
-        logging.warning(f"Failed to load static eager INT8 state from {int8_static_eager_path}: {e}")
-        # Fallback: run full calibration+convert and overwrite saved file
-        print("Fallback: running calibration + convert for Static Eager INT8...")
-        tq.prepare(eager_quant_model, inplace=True)
-        print("Running calibration over subset of training data...")
-        with torch.no_grad():
-            for xb, _ in calib_loader_eager:
-                xb = _format_tensor_for_model(xb, eager_quant_model).to("cpu")
-                _ = eager_quant_model(xb)
-        model_int8_static_eager = tq.convert(eager_quant_model, inplace=False).eval()
-        int8_static_eager_size = _save_state_dict_get_size_mb(
-            model_int8_static_eager.state_dict(),
-            int8_static_eager_path
-        )
-else:
-    int8_static_eager_path = os.path.join(PROCESSED_DIR, "model_int8_static_eager_state.pth")
-    int8_static_eager_size = _save_state_dict_get_size_mb(
-        model_int8_static_eager.state_dict(),
-        int8_static_eager_path
-    )
+    # Save
+    out_path = os.path.join(PROCESSED_DIR, f"model_int8_static_eager_{name_suffix}.pth")
+    int8_size = _save_state_dict_get_size_mb(model_int8.state_dict(), out_path)
 
-print("Evaluating Static Eager INT8 model (CPU)...")
-# quantized ops only supported on CPU
-static_eager_auc = evaluate_model_torch(model_int8_static_eager, X_test, y_test, device="cpu")
-print("Running inference speed comparison (CPU)...")
-static_eager_time = measure_avg_inference_time(model_int8_static_eager, X_test, n_repeats=2, device="cpu")
-add("Static Eager INT8", model=model_int8_static_eager, size=int8_static_eager_size, inference_time=static_eager_time)
-print("Static Eager INT8 Quantization Comparison Finished!")
+    # Evaluate INT8
+    print("Evaluating INT8 model (CPU)...")
+    auc = evaluate_model_torch(model_int8, X_test_data, y_test_data, device="cpu")
+
+    print("Benchmarking inference time (CPU)...")
+    speed = measure_avg_inference_time(model_int8, X_test_data, n_repeats=2)
+
+    # Add to big result table
+    add(f"Static Eager INT8 ({name_suffix})", model=model_int8, size=int8_size, inference_time=speed)
+
+    print(f"✔ Done Static Eager ({name_suffix}) — AUC={auc:.4f}, size={int8_size:.2f} MB, time={speed*1000:.2f} ms")
+    return model_int8, auc, int8_size, speed
+
+
+
+# ============================================================
+# RUN STATIC EAGER FOR FP32 MODEL
+# ============================================================
+print("\n### Running Static Eager — Baseline FP32")
+model_int8_static_fp32, auc_fp32, size_fp32, time_fp32 = run_static_eager_quantization(
+    float_model=model_fp32,
+    X_train_data=X_train,
+    X_test_data=X_test,
+    y_test_data=y_test,
+    name_suffix="fp32"
+)
+
+
+print("\nStatic Eager PTQ for BOTH FP32 completed!")
 print(results_df.to_string(index=False))
 results_df
 
 # %% [markdown]
 # ---
-##### 3. STATIC QUANTIZATION (FX GRAPH MODE)
-# %% 3. STATIC QUANTIZATION (FX GRAPH MODE)
-# 3. STATIC QUANTIZATION (FX GRAPH MODE)
+##### 5.3. STATIC QUANTIZATION (FX GRAPH MODE)
+# %% 5.3. STATIC QUANTIZATION (FX GRAPH MODE)
+# 5.3. STATIC QUANTIZATION (FX GRAPH MODE)
 print("\n------------------------------------------------------------------------------------------------------------------------")
 print("STATIC FX QUANTIZATION\n")
 print("Starting Static FX Quantization Comparison...")
@@ -1741,9 +1807,9 @@ results_df
 
 # %% [markdown]
 # ---
-##### 4. QUANTIZATION-AWARE TRAINING (QAT) WITH FX
-# %% 4. QUANTIZATION-AWARE TRAINING (QAT) WITH FX
-# 4. QUANTIZATION-AWARE TRAINING (QAT) WITH FX
+##### 5.4. QUANTIZATION-AWARE TRAINING (QAT) WITH FX
+# %% 5.4. QUANTIZATION-AWARE TRAINING (QAT) WITH FX
+# 5.4. QUANTIZATION-AWARE TRAINING (QAT) WITH FX
 print("\n------------------------------------------------------------------------------------------------------------------------")
 print("QUANTIZATION-AWARE TRAINING (QAT)\n")
 
@@ -1901,9 +1967,10 @@ results_df
 
 # %% [markdown]
 # ---
-##### 5. ONNX EXPORT + INT8 QUANTIZATION
+##### 5.5. ONNX EXPORT + INT8 QUANTIZATION
 
-# %%
+# %% 5.5. ONNX EXPORT + INT8 QUANTIZATION
+# 5.5. ONNX EXPORT + INT8 QUANTIZATION
 import onnx
 import onnxruntime as ort
 import onnxruntime.quantization.quant_utils as qutils
@@ -2152,98 +2219,99 @@ results_df
 
 # %% [markdown]
 # ---
-##### 6. Quantization-Optimized EEGCNN (with Conv+ReLU fusion)
+##### 5.6. Quantization-Optimized EEGCNN (with Conv+ReLU fusion)
 
-# %% 6. Quantization-Optimized EEGCNN (with Conv+ReLU fusion)
-# 6. Quantization-Optimized EEGCNN (with Conv+ReLU fusion)
+# %% 5.6. Quantization-Optimized EEGCNN (with Conv+ReLU fusion)
+# 5.6. Quantization-Optimized EEGCNN (with Conv+ReLU fusion)
 class EEGCNN_Q(nn.Module):
     """
-    Quantization-friendly CNN:
-    - Explicit ReLUs for fusion
-    - No AdaptiveAvgPool2d (replaced with tensor.mean)
-    - Conv+ReLU blocks can be fused for INT8 acceleration
+    Quantization-friendly version of EEGCNN.
+
+    - Same architecture as EEGCNN:
+        * Conv1d blocks with MaxPool1d(2)
+        * AdaptiveAvgPool1d(1) -> squeeze -> FC head 256→128→64→1
+    - Explicit ReLU modules for fusion:
+        * convX + reluX
+        * fcX + relu_fcX
     """
 
-    def __init__(self):
+    def __init__(self, in_channels):
         super().__init__()
 
+        # ----- Conv1d Blocks (same as EEGCNN) -----
         # Block 1
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=(2,4), padding=(1,1))
+        self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=3, padding=1)
         self.relu1 = nn.ReLU()
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=(2,4), stride=(1,2), padding=(1,1))
+        self.conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
         self.relu2 = nn.ReLU()
-        self.maxpool1 = nn.MaxPool2d((1,2))
+        self.pool1 = nn.MaxPool1d(2)
 
         # Block 2
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=(2,4), padding=(1,1))
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
         self.relu3 = nn.ReLU()
-        self.conv4 = nn.Conv2d(128, 128, kernel_size=(2,4), stride=(1,2), padding=(1,1))
+        self.conv4 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
         self.relu4 = nn.ReLU()
-        self.maxpool2 = nn.MaxPool2d((2,2))
+        self.pool2 = nn.MaxPool1d(2)
 
         # Block 3
-        self.conv5 = nn.Conv2d(128, 256, kernel_size=(4,4), padding=(1,1))
+        self.conv5 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
         self.relu5 = nn.ReLU()
-        self.conv6 = nn.Conv2d(256, 256, kernel_size=(4,4), stride=(1,2), padding=(1,1))
+        self.conv6 = nn.Conv1d(256, 256, kernel_size=3, padding=1)
         self.relu6 = nn.ReLU()
-        self.maxpool3 = nn.MaxPool2d((1,2))
+        self.pool3 = nn.MaxPool1d(2)
 
-        # Global pooling  mean (quant-friendly)
-        # self.global_avgpool = nn.AdaptiveAvgPool2d((1,1))  # removed
+        # Global pooling (identical to EEGCNN)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-        # Fully-connected head
-        self.fc1 = nn.Linear(256, 256)
+        # ----- Classification Head (same dims as EEGCNN) -----
+        self.fc1 = nn.Linear(256, 128)
         self.relu_fc1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(0.25)
-
-        self.fc2 = nn.Linear(256, 128)
+        self.fc2 = nn.Linear(128, 64)
         self.relu_fc2 = nn.ReLU()
-
-        self.fc3 = nn.Linear(128, 64)
-        self.relu_fc3 = nn.ReLU()
-        self.dropout2 = nn.Dropout(0.25)
-
-        self.fc4 = nn.Linear(64, 1)
+        self.fc3 = nn.Linear(64, 1)
 
     def fuse_model(self):
         """
-        Prepare Conv+ReLU fusion so FX static quantization
-        can make real INT8 conv kernels. No pooling is fused.
+        Fuse Conv+ReLU and Linear+ReLU blocks for INT8 acceleration.
+        This is used by FX/eager quantization pipelines.
         """
-        fuse_modules(self, [["conv1", "relu1"]], inplace=True)
-        fuse_modules(self, [["conv2", "relu2"]], inplace=True)
-        fuse_modules(self, [["conv3", "relu3"]], inplace=True)
-        fuse_modules(self, [["conv4", "relu4"]], inplace=True)
-        fuse_modules(self, [["conv5", "relu5"]], inplace=True)
-        fuse_modules(self, [["conv6", "relu6"]], inplace=True)
+        fuse_modules(self, ["conv1", "relu1"], inplace=True)
+        fuse_modules(self, ["conv2", "relu2"], inplace=True)
+        fuse_modules(self, ["conv3", "relu3"], inplace=True)
+        fuse_modules(self, ["conv4", "relu4"], inplace=True)
+        fuse_modules(self, ["conv5", "relu5"], inplace=True)
+        fuse_modules(self, ["conv6", "relu6"], inplace=True)
 
-        # Fully connected layers also fuse with ReLU
-        fuse_modules(self, [["fc1", "relu_fc1"]], inplace=True)
-        fuse_modules(self, [["fc2", "relu_fc2"]], inplace=True)
-        fuse_modules(self, [["fc3", "relu_fc3"]], inplace=True)
+        fuse_modules(self, ["fc1", "relu_fc1"], inplace=True)
+        fuse_modules(self, ["fc2", "relu_fc2"], inplace=True)
+        # fc3 has no ReLU afterwards, so nothing to fuse
 
     def forward(self, x):
+        # x: (B, C, T)  — same as EEGCNN
+
+        # Block 1
         x = self.relu1(self.conv1(x))
         x = self.relu2(self.conv2(x))
-        x = self.maxpool1(x)
+        x = self.pool1(x)
 
+        # Block 2
         x = self.relu3(self.conv3(x))
         x = self.relu4(self.conv4(x))
-        x = self.maxpool2(x)
+        x = self.pool2(x)
 
+        # Block 3
         x = self.relu5(self.conv5(x))
         x = self.relu6(self.conv6(x))
-        x = self.maxpool3(x)
+        x = self.pool3(x)
 
-        # Global quantization-friendly average pooling
-        x = x.mean(dim=[2,3], keepdim=False)   #  (B, 256)
+        # Global pooling (same behavior as original)
+        x = self.global_pool(x).squeeze(-1)   # (B, 256)
 
+        # FC head
         x = self.relu_fc1(self.fc1(x))
-        x = self.dropout1(x)
         x = self.relu_fc2(self.fc2(x))
-        x = self.relu_fc3(self.fc3(x))
-        x = self.dropout2(x)
-        x = self.fc4(x)
+        x = self.fc3(x)                       # (B, 1)
+
         return x.squeeze(1)
 
 ####  FX STATIC QUANTIZATION (using fused quantization-ready model)
@@ -2251,7 +2319,7 @@ print("Running FX STATIC QUANTIZATION on fused model...")
 print("Creating quantization-ready fused model...")
 
 # Create model
-model_fp32_fused = EEGCNN_Q().cpu().eval()
+model_fp32_fused = EEGCNN_Q(in_channels=len(CHANNELS)).cpu().eval()
 
 # Load trained weights from original unfused model if shapes match
 try:
@@ -2320,10 +2388,10 @@ results_df
 
 #%% [markdown]
 # ---
-##### 7. FUSED QUANTIZATION-AWARE TRAINING (QAT)
+##### 5.7. FUSED QUANTIZATION-AWARE TRAINING (QAT)
 
-#%% 7. FUSED QUANTIZATION-AWARE TRAINING (QAT)
-# 7. FUSED QUANTIZATION-AWARE TRAINING (QAT)
+#%% 5.7. FUSED QUANTIZATION-AWARE TRAINING (QAT)
+# 5.7. FUSED QUANTIZATION-AWARE TRAINING (QAT)
 print("\n------------------------------------------------------------------------------------------------------------------------")
 print("Fused QAT (EEGCNN_Q) QUANTIZATION\n")
 
@@ -2348,7 +2416,7 @@ def _load_matching_weights(target: nn.Module, source_state: dict):
 
 
 # 1. Create fused model
-model_q_fused = EEGCNN_Q().cpu().eval()
+model_q_fused = EEGCNN_Q(in_channels=len(CHANNELS)).cpu().eval()
 
 # Load FP32 pretrained weights
 loaded, info = _load_matching_weights(model_q_fused, model_fp32.state_dict())
@@ -2431,6 +2499,245 @@ print("Fused QAT comparison complete!")
 print(results_df.to_string(index=False))
 results_df
 
+
+#%% [markdown]
+# ---
+##### 5.8. FUSED ONNX EXPORT + INT8 QUANTIZATION
+#%% 5.8. FUSED ONNX EXPORT + INT8 QUANTIZATION
+# 5.8. FUSED ONNX EXPORT + INT8 QUANTIZATION
+import onnx
+import onnxruntime as ort
+import onnxruntime.quantization.quant_utils as qutils
+from onnxruntime.quantization import (
+    quantize_dynamic, quantize_static, QuantType, CalibrationDataReader
+)
+from onnx import TensorProto
+
+print("\n------------------------------------------------------------------------------------------------------------------------")
+print("FUSED ONNX EXPORT + INT8 QUANTIZATION\n")
+
+# ============================================================
+# 0. PATCH  Disable ONNX shape inference everywhere
+# ============================================================
+
+def _skip_shape_inference(model_path: str):
+    # ORT will call this instead of running inference
+    return onnx.load(model_path)
+
+qutils.load_model_with_shape_infer = _skip_shape_inference
+
+# ============================================================
+# 1. EXPORT FP32 MODEL TO ONNX (cache-aware)
+# ============================================================
+
+onnx_fp32_path = os.path.join(PROCESSED_DIR, "seizure_cnn_fp32_fused.onnx")
+onnx_int8_dynamic_path = os.path.join(PROCESSED_DIR, "seizure_cnn_int8_dynamic_fused.onnx")
+onnx_int8_static_path = os.path.join(PROCESSED_DIR, "seizure_cnn_int8_static_fused.onnx")
+
+
+dummy = _example_input_for_model(model_fp32_fused, X_train.shape[1], X_train.shape[2]).cpu()
+print("Exporting FP32 model to ONNX (opset 18)")
+torch.onnx.export(
+    model_fp32_fused.cpu(),
+    dummy,
+    onnx_fp32_path,
+    export_params=True,
+    opset_version=18,
+    do_constant_folding=True,
+    input_names=["input"],
+    output_names=["output"],
+    dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+)
+fp32_onnx_available = True
+try:
+    onnx_input_rank = len(onnx.load(onnx_fp32_path).graph.input[0].type.tensor_type.shape.dim)
+except Exception:
+    onnx_input_rank = None
+print("Saved ONNX:", onnx_fp32_path)
+
+# ============================================================
+# 2. BASELINE ONNX FP32 INFERENCE
+# ============================================================
+
+def onnx_predict(sess, X, batch=32):
+    input_meta = sess.get_inputs()[0]
+    input_rank = len(input_meta.shape)
+    name = input_meta.name
+    outs = []
+    for i in range(0, len(X), batch):
+        xb = X[i:i+batch].astype(np.float32)
+        if input_rank == 4:
+            xb = xb[:, None, :, :]
+        logits = sess.run(None, {name: xb})[0]
+        logits = np.clip(logits, -30, 30)
+        outs.append(1 / (1 + np.exp(-logits)))
+    return np.concatenate(outs).ravel()
+
+def eval_onnx(path):
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    probs = onnx_predict(sess, X_test)
+    auc = roc_auc_score(y_test, probs)
+    return auc, probs
+
+def collect_all_metrics_onnx(model_path: str, batch: int = 32):
+    if not os.path.exists(model_path):
+        return None
+    try:
+        sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    except Exception as e:
+        logging.warning(f"collect_all_metrics_onnx: failed to load {model_path}: {e}")
+        return None
+
+    metrics = {}
+    val_probs = onnx_predict(sess, X_val, batch=batch)
+    metrics.update(_metrics_from_probs(y_val, val_probs, "Val"))
+
+    test_probs = onnx_predict(sess, X_test, batch=batch)
+    metrics.update(_metrics_from_probs(y_test, test_probs, "Test"))
+    return metrics
+
+fp32_onnx_auc = None
+if fp32_onnx_available:
+    print("Evaluating FP32 ONNX baseline")
+    fp32_onnx_auc, _ = eval_onnx(onnx_fp32_path)
+    print("FP32 ONNX AUC:", fp32_onnx_auc)
+else:
+    logging.warning("FP32 ONNX model unavailable  skipping baseline ONNX evaluation.")
+
+# ============================================================
+# 3. DYNAMIC INT8 QUANTIZATION (cache-aware)
+# ============================================================
+
+dyn_onnx_available = os.path.exists(onnx_int8_dynamic_path)
+
+if dyn_onnx_available:
+    print(f"Using cached Dynamic INT8 ONNX model at {onnx_int8_dynamic_path}")
+elif fp32_onnx_available:
+    print("ONNX Dynamic INT8 quantization")
+    quantize_dynamic(
+        model_input=onnx_fp32_path,
+        model_output=onnx_int8_dynamic_path,
+        weight_type=QuantType.QInt8,
+        op_types_to_quantize=["MatMul", "Gemm"],
+        use_external_data_format=False,
+        extra_options={
+            # Required because shape inference is disabled
+            "DefaultTensorType": TensorProto.FLOAT,
+        }
+    )
+    dyn_onnx_available = True
+    print("Dynamic INT8 saved:", onnx_int8_dynamic_path)
+else:
+    logging.warning("Skipping ONNX dynamic quantization: FP32 ONNX model unavailable.")
+
+dyn_auc = None
+if dyn_onnx_available:
+    dyn_auc, _ = eval_onnx(onnx_int8_dynamic_path)
+    print("Dynamic INT8 AUC:", dyn_auc)
+
+# ============================================================
+# 4. STATIC INT8 (QDQ) CALIBRATION QUANTIZATION (cache-aware)
+# ============================================================
+
+static_onnx_available = os.path.exists(onnx_int8_static_path)
+
+class EEGCalibReader(CalibrationDataReader):
+    def __init__(self, X, max_samples=512, bs=32, input_rank: Optional[int] = None):
+        idx = np.random.choice(len(X), min(max_samples, len(X)), replace=False)
+        self.data = X[idx]
+        self.bs   = bs
+        self.ptr  = 0
+        self.input_rank = input_rank
+
+    def get_next(self):
+        if self.ptr >= len(self.data):
+            return None
+        b = self.data[self.ptr:self.ptr+self.bs]
+        self.ptr += self.bs
+        xb = b.astype(np.float32)
+        if self.input_rank == 4:
+            xb = xb[:, None, :, :]
+        return {"input": xb}
+
+if static_onnx_available:
+    print(f"Using cached Static INT8 ONNX model at {onnx_int8_static_path}")
+elif fp32_onnx_available:
+    print("Running static QDQ INT8 quantization")
+    quantize_static(
+        model_input=onnx_fp32_path,
+        model_output=onnx_int8_static_path,
+        calibration_data_reader=EEGCalibReader(X_train, input_rank=onnx_input_rank),
+        quant_format="QDQ",
+        weight_type=QuantType.QInt8,
+        activation_type=QuantType.QInt8,
+        extra_options={
+            "DefaultTensorType": TensorProto.FLOAT,
+        }
+    )
+    static_onnx_available = True
+    print("Static INT8 saved:", onnx_int8_static_path)
+else:
+    logging.warning("Skipping ONNX static quantization: FP32 ONNX model unavailable.")
+
+static_auc = None
+if static_onnx_available:
+    static_auc, _ = eval_onnx(onnx_int8_static_path)
+    print("Static QDQ INT8 AUC:", static_auc)
+
+# ============================================================
+# 5. INFERENCE TIME BENCHMARK
+# ============================================================
+
+def onnx_bench(path, X, reps=2):
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    input_meta = sess.get_inputs()[0]
+    input_rank = len(input_meta.shape)
+    name = input_meta.name
+    xb = X[:128].astype(np.float32)
+    if input_rank == 4:
+        xb = xb[:, None, :, :]
+    t = []
+    for _ in range(reps):
+        s = time.time()
+        _ = sess.run(None, {name: xb})
+        t.append(time.time() - s)
+    return np.mean(t) / len(xb)
+
+fp32_time_onnx = onnx_bench(onnx_fp32_path, X_test) if fp32_onnx_available else None
+dyn_time_onnx = onnx_bench(onnx_int8_dynamic_path, X_test) if dyn_onnx_available else None
+static_time_onnx = onnx_bench(onnx_int8_static_path, X_test) if static_onnx_available else None
+
+
+# ============================================================
+# 7. FINAL FORMATTED COMPARISON (FP32 vs ONNX Dynamic vs ONNX Static)
+# ============================================================
+
+def onnx_size(path):
+    total = os.path.getsize(path)
+    data_path = path + ".data"
+    if os.path.exists(data_path):
+        total += os.path.getsize(data_path)
+    return total / (1024*1024)
+
+fp32_size_mb = onnx_size(onnx_fp32_path) if fp32_onnx_available else None
+dyn_size_mb = onnx_size(onnx_int8_dynamic_path) if dyn_onnx_available else None
+static_size_mb = onnx_size(onnx_int8_static_path) if static_onnx_available else None
+
+fp32_onnx_metrics = collect_all_metrics_onnx(onnx_fp32_path) if fp32_onnx_available else None
+dyn_onnx_metrics = collect_all_metrics_onnx(onnx_int8_dynamic_path) if dyn_onnx_available else None
+static_onnx_metrics = collect_all_metrics_onnx(onnx_int8_static_path) if static_onnx_available else None
+
+# --- Add FP32 ONNX baseline ---
+add("Fused FP32 ONNX", size=fp32_size_mb, inference_time=fp32_time_onnx, metrics=fp32_onnx_metrics)
+# --- Add Dynamic INT8 ONNX ---
+add("Fused Dynamic INT8 ONNX", size=dyn_size_mb, inference_time=dyn_time_onnx, metrics=dyn_onnx_metrics)
+# --- Add Static INT8 ONNX ---
+add("Fused Static INT8 ONNX", size=static_size_mb, inference_time=static_time_onnx, metrics=static_onnx_metrics)
+# Show updated DataFrame
+print("Fused ONNX Comparison Finished!")
+print(results_df.to_string(index=False))
+results_df
+
 # %% [markdown]
 # ---
 #####   FINAL SUMMARY TABLE - ALL METHODS COMPARED
@@ -2447,4 +2754,5 @@ results_df
 csv_path = os.path.join(PROCESSED_DIR, "quantization_results.csv")
 results_df.to_csv(csv_path, index=True)
 
-#%%
+# %%
+
