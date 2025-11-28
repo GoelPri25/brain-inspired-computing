@@ -32,5 +32,6 @@ The core implementation and various analyses are distributed across the followin
 
 - **`final.ipynb`**: This Jupyter Notebook is used for **visualization of the final runs and results**. It generates the tables and figures (like Table 1, Table 2) mentioned in the paper to compare model efficiency (latency, energy, size) and performance (AUC, accuracy) across all configurations.
 
-- **`channel_analysis.ipynb`**: **channel analysis** steps described in Section 2.1, including calculating channel coverage and selecting the final 18-channel input feature set.
+- **`ChannelAnalysis.ipynb`**: **channel analysis** steps described in Section 2.1, including calculating channel coverage and selecting the final 18-channel input feature set.
+
 
