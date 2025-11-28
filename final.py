@@ -199,6 +199,144 @@ def load_seizure_mask(edf_path: str, n_samples: int, fs: float) -> np.ndarray:
 # ---
 # #### 1.2 PER-FILE WINDOWING 
 # %%
+def detect_gaps_from_data(data: np.ndarray, gap_range_thresh: float = 5e-6):
+    """
+    data: np.ndarray shape (n_channels, n_samples)
+    returns: valid_mask (bool array length n_samples), gap_intervals list of (start_idx, end_idx)
+    Gap definition: sample is gap if any channel NaN OR range across channels < threshold.
+    """
+    n_ch, n_s = data.shape
+    # detect NaNs
+    nan_mask = np.any(np.isnan(data), axis=0)
+
+    # compute per-sample range across channels
+    ch_max = np.max(data, axis=0)
+    ch_min = np.min(data, axis=0)
+    ch_range = ch_max - ch_min
+
+    gap_mask = (ch_range < gap_range_thresh) | nan_mask  # True => gap sample
+    valid_mask = ~gap_mask
+
+    # convert contiguous gap samples to intervals
+    gap_intervals = []
+    in_gap = False
+    start = 0
+    for i, g in enumerate(gap_mask):
+        if g and not in_gap:
+            in_gap = True
+            start = i
+        elif not g and in_gap:
+            in_gap = False
+            gap_intervals.append((start, i))
+    if in_gap:
+        gap_intervals.append((start, n_s))
+
+    return valid_mask, gap_intervals
+
+def preprocess_raw_edf(
+    edf_path: str,
+    channels: List[str],
+    target_fs: float,
+    apply_bandpass: bool = True,
+):
+    """
+    Loads EDF, removes dummy/ECG/VNS channels, detects gaps,
+    filters, normalizes, downsamples, and returns cleaned data + masks.
+
+    Returns:
+        data      : np.ndarray (n_channels, n_samples_clean)
+        sz_mask   : np.ndarray (n_samples_clean,)
+        fs        : sampling frequency after preprocessing
+        gap_info  : dict with stats
+    """
+
+   
+    # Load EDF
+    # ------------------------------------
+    raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR")
+
+   
+    # Remove dummy / ECG / VNS signals
+    # ------------------------------------
+    bad_patterns = ["-"]
+    bad_chs = []
+
+    for ch in raw.ch_names:
+        name = ch.strip()
+    
+        # Dummy channels are literally a single '-'
+        if name == "-":
+            bad_chs.append(ch)
+    
+    if len(bad_chs) > 0:
+        raw.drop_channels(bad_chs)
+
+    # Keep only required target EEG channels
+    available = set(raw.ch_names)
+    if not all(ch in available for ch in channels):
+        return None, None, None, None
+
+    raw.pick(channels)
+
+
+    # Original sampling rate
+    # ------------------------------------
+    fs = float(raw.info["sfreq"])
+
+   
+    # Detect gaps BEFORE filtering
+    # ------------------------------------
+    data_pre = raw.get_data().copy()  # (n_ch, n_samples)
+    valid_mask, gap_intervals = detect_gaps_from_data(data_pre, gap_range_thresh=5e-6)
+
+    # Stats for report
+    total_samples = len(valid_mask)
+    n_gap_samples = np.sum(~valid_mask)
+
+    gap_info = {
+        "total_samples": total_samples,
+        "gap_samples": int(n_gap_samples),
+        "gap_percentage": float(n_gap_samples / total_samples * 100),
+        "num_gaps": len(gap_intervals),
+        "gap_intervals": gap_intervals,
+    }
+
+    # Remove gaps
+    data_pre = data_pre[:, valid_mask]
+
+
+    # Load seizure mask and remove gap samples in sync
+    # ------------------------------------
+    sz_mask_full = load_seizure_mask(edf_path, total_samples, fs)
+    sz_mask = sz_mask_full[valid_mask]
+
+    
+    # Band-pass filter
+    # ------------------------------------
+    if apply_bandpass:
+        raw_filt = mne.io.RawArray(data_pre, raw.info.copy())
+        raw_filt.filter(0.5, 40.0, method="fir", verbose="ERROR")
+        data_pre = raw_filt.get_data()
+
+ 
+    # Normalization (z-score per channel)
+    # ------------------------------------
+    data_pre = (data_pre - np.mean(data_pre, axis=1, keepdims=True)) / (
+        np.std(data_pre, axis=1, keepdims=True) + 1e-6
+    )
+
+
+    # Downsample
+    # ------------------------------------
+    if fs != target_fs:
+        factor = int(round(fs / target_fs))
+        data_pre = data_pre[:, ::factor]
+        sz_mask = sz_mask[::factor]
+        fs = fs / factor
+
+    return data_pre, sz_mask.astype(np.int8), fs, gap_info
+
+
 def process_file_to_windows(
     edf_path: str,
     channels: List[str],
@@ -206,106 +344,70 @@ def process_file_to_windows(
     time_step: float,
     target_fs: float,
     p_non_seizure: float
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+):
     """
-    Read one EDF file, extract sliding windows for the specified channels,
-    and return:
-        segments: (N_windows_selected, n_channels, n_time_samples)
-        labels:   (N_windows_selected,) bool (True = seizure)
+    Full preprocessing + sliding window extraction.
+    """
 
-    Returns (None, None) if channels are not all present or no windows selected.
-    """
-    try:
-        raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR")
-    except Exception as e:
-        logging.warning(f"Failed to read {edf_path}: {e}")
+    
+    # Use unified preprocessing function
+    # ------------------------------------
+    result = preprocess_raw_edf(edf_path, channels, target_fs)
+
+    if result[0] is None:
         return None, None
 
-    # Check channel availability
-    available = set(raw.ch_names)
-    if not all(ch in available for ch in channels):
-        logging.info(f"Skipping {edf_path}: required channels missing.")
-        return None, None
-
-    raw.pick(channels)
-    fs = float(raw.info["sfreq"])
-    data = raw.get_data() * 1e6  # convert to microvolts
+    data, sz_mask, fs, gap_info = result
     n_channels, n_samples = data.shape
 
-    # Build sample-level seizure mask (based on original sampling rate)
-    sz_mask = load_seizure_mask(edf_path, n_samples, fs)
-
-    # Downsample to target_fs by simple decimation (integer factor)
-    if fs != target_fs:
-        factor = int(round(fs / target_fs))
-        if factor <= 0:
-            raise ValueError(f"Invalid downsampling factor from fs={fs} to {target_fs}")
-        data = data[:, ::factor]
-        sz_mask = sz_mask[::factor]
-        fs = fs / factor
-        n_channels, n_samples = data.shape
-
-    # Convert seconds to samples
+ 
+    # Sliding windows
+    # ------------------------------------
     win_len = int(round(time_window * fs))
     step = int(round(time_step * fs))
 
     if n_samples < win_len:
         return None, None
 
-    # Number of windows
     n_windows = 1 + (n_samples - win_len) // step
-    if n_windows <= 0:
-        return None, None
-
-    # Compute seizure ratio for each window and keep segments in memory
     segs = []
     ratios = []
 
     for i in range(n_windows):
-        start = i * step
-        end = start + win_len
-        seg = data[:, start:end]
-        # Safety check for shape
-        if seg.shape[1] != win_len:
-            continue
+        s = i * step
+        e = s + win_len
+        seg = data[:, s:e]
         segs.append(seg)
+        ratios.append(sz_mask[s:e].mean())
 
-        win_mask = sz_mask[start:end]
-        ratio = win_mask.mean() if len(win_mask) > 0 else 0.0
-        ratios.append(ratio)
-
-    segs = np.stack(segs, axis=0)  # (n_windows, n_channels, win_len)
+    segs = np.stack(segs)
     ratios = np.array(ratios)
 
-    # Select seizure and a subset of non-seizure windows
+  
+    # Select positive and negative windows
+    # ------------------------------------
     idx_pos = np.where(ratios > 0.0)[0]
     idx_neg = np.where(ratios == 0.0)[0]
-
-    selected_indices = []
+    selected = []
 
     if len(idx_pos) > 0:
-        selected_indices.append(idx_pos)
+        selected.append(idx_pos)
 
-    if len(idx_neg) > 0 and p_non_seizure > 0.0:
-        n_neg = int(round(p_non_seizure * len(idx_neg)))
-        n_neg = max(0, min(n_neg, len(idx_neg)))
-        if n_neg > 0:
-            chosen_neg = np.random.choice(idx_neg, size=n_neg, replace=False)
-            selected_indices.append(chosen_neg)
+    if len(idx_neg) > 0:
+        n_neg = int(p_non_seizure * len(idx_neg))
+        chosen = np.random.choice(idx_neg, n_neg, replace=False)
+        selected.append(chosen)
 
-    if not selected_indices:
+    if not selected:
         return None, None
 
-    selected_indices = np.concatenate(selected_indices)
-    np.random.shuffle(selected_indices)
+    selected = np.concatenate(selected)
+    np.random.shuffle(selected)
 
-    segs = segs[selected_indices]
-    labels = ratios[selected_indices] > 0.0  # bool: seizure if any seizure in window
+    segs = segs[selected]
+    labels = ratios[selected] > 0.0
 
-    return segs, labels
-
-
-# %% [markdown]
+    return segs, labels# %% [markdown]
 # ---
 #  #### 1.3 DATASET BUILDING
 # %%
